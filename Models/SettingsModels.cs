@@ -144,6 +144,20 @@ public sealed class UsbDeviceInfo
 {
     public string DriveLetter { get; init; } = string.Empty;
     public string Name { get; init; } = "USB Drive";
+
+    /// <summary>
+    /// The identifier to persist for this device, preferring the physical (PNP) id so the
+    /// choice survives a drive-letter change.
+    /// </summary>
     public string InstanceId { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Every identifier this device can be recognised by: the preferred id, the PNP id, the
+    /// volume serial and the drive letter. Presence checks match against all of them, so a
+    /// saved value still matches when a scan can only produce a different identifier, for
+    /// example a transient WMI failure that leaves only the volume serial available.
+    /// </summary>
+    public IReadOnlyList<string> Identifiers { get; init; } = Array.Empty<string>();
+
     public override string ToString() => $"{DriveLetter}  ·  {Name}";
 }

@@ -795,7 +795,13 @@ public sealed partial class MainWindow : Window
 
         if (selected is not null)
         {
-            var matching = devices.FirstOrDefault(d => string.Equals(d.InstanceId, selected, StringComparison.OrdinalIgnoreCase));
+            // Restore the selection from the list that is actually bound. A scan returns
+            // brand-new instances, so searching the fresh collection can pick an object that
+            // is not in the ItemsSource and the selection would silently fail to appear.
+            var bound = UsbList.ItemsSource as IEnumerable<UsbDeviceInfo> ?? devices;
+            var matching = bound.FirstOrDefault(d =>
+                string.Equals(d.InstanceId, selected, StringComparison.OrdinalIgnoreCase)
+                || d.Identifiers.Contains(selected, StringComparer.OrdinalIgnoreCase));
             if (matching is not null && !ReferenceEquals(UsbList.SelectedItem, matching))
             {
                 UsbList.SelectedItem = matching;
