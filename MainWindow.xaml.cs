@@ -331,9 +331,9 @@ public sealed partial class MainWindow : Window
 
     /// <summary>
     /// Applies the enabled look to every page. The inactive policy pages stay visible so the
-    /// user can see what else exists, but are dimmed and ignore input. This is the single
-    /// source of truth for that state, so navigation cannot leave a page looking active while
-    /// it silently ignores input.
+    /// user can see what else exists, but they are disabled and ignore both pointer and
+    /// keyboard input. This is the single source of truth for that state, so navigation
+    /// cannot leave a page looking active while it silently ignores input.
     /// </summary>
     private void RefreshSectionEnabledStates(LockMode mode)
     {
@@ -346,16 +346,16 @@ public sealed partial class MainWindow : Window
     /// Dims a page and stops it accepting input.
     /// </summary>
     /// <remarks>
-    /// The opacity is set on the container because StackPanel and TextBlock have no
-    /// IsEnabled, so dimming the container is the only way to grey everything on the page,
-    /// including its title and a list's empty-state text. IsHitTestVisible is the input
-    /// guard, kept as the existing mechanism; IsEnabled is deliberately avoided because the
-    /// scan button manages its own enabled state while a scan runs, and writing it here
-    /// would clear that.
+    /// The state is applied to a ContentControl wrapper because <c>IsHitTestVisible=false</c>
+    /// only blocks the pointer: Tab focus still enters the controls of a page that is
+    /// supposed to be off, which let the keyboard reach an inactive policy. IsEnabled on the
+    /// wrapper disables the whole subtree for both input paths, and a descendant cannot
+    /// re-enable itself against a disabled ancestor, so a control's own busy state (the scan
+    /// button) is preserved rather than overwritten.
     /// </remarks>
-    private static void ApplySectionEnabledState(Panel element, bool enabled)
+    private static void ApplySectionEnabledState(ContentControl element, bool enabled)
     {
-        element.IsHitTestVisible = enabled;
+        element.IsEnabled = enabled;
         element.Opacity = enabled ? 1 : DisabledSectionOpacity;
     }
 
