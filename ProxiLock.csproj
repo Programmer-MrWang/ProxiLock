@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk" TreatAsLocalProperty="Platform">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <RootNamespace>ProxiLock</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- WinUI 3 and the self-contained Windows App SDK payload require an explicit Windows architecture. -->
+    <Platform Condition="'$(Platform)' == '' or '$(Platform)' == 'AnyCPU' or '$(Platform)' == 'Any CPU'">x64</Platform>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <!-- Use the user-provided root icon for the executable and all shell surfaces. -->
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <!-- Program.cs owns Main; keep the XAML compiler helper while disabling its competing entry point. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- Make the intended entry point explicit for IDE/design-time builds as well. -->
+    <StartupObject>ProxiLock.Program</StartupObject>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin\**;obj\**;buildobj\**;buildbin\**;.idea\**</DefaultItemExcludes>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
+    <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.2.251219" />
+    <PackageReference Include="System.Management" Version="10.0.3" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="icon.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Always" ExcludeFromSingleFile="true" />
+    <Content Include="icon.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Always" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+  <ItemGroup>
+    <ShellIconFiles Include="$(MSBuildProjectDirectory)\icon.ico" />
+    <ShellIconFiles Include="$(MSBuildProjectDirectory)\icon.png" />
+  </ItemGroup>
+  <Target Name="CopyShellIconsAfterPublish" AfterTargets="Publish">
+    <Copy SourceFiles="@(ShellIconFiles)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <ItemGroup>
+    <Compile Remove="bin\**" />
+    <EmbeddedResource Remove="bin\**" />
+    <None Remove="bin\**" />
+    <Compile Remove="obj\**" />
+    <EmbeddedResource Remove="obj\**" />
+    <None Remove="obj\**" />
+    <Compile Remove="buildobj\**" />
+    <EmbeddedResource Remove="buildobj\**" />
+    <None Remove="buildobj\**" />
+    <Compile Remove="buildbin\**" />
+    <EmbeddedResource Remove="buildbin\**" />
+    <None Remove="buildbin\**" />
+  </ItemGroup>
+</Project>

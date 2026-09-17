@@ -1,0 +1,43 @@
+<UserControl
+    x:Class="ProxiLock.TrayHost"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tb="using:H.NotifyIcon">
+    <tb:TaskbarIcon
+        x:Name="TrayIcon"
+        ContextMenuMode="SecondWindow"
+        IconSource="ms-appx:///icon.ico"
+        NoLeftClickDelay="True"
+        ToolTipText="ProxiLock">
+        <tb:TaskbarIcon.ContextFlyout>
+            <MenuFlyout
+                AreOpenCloseAnimationsEnabled="True"
+                LightDismissOverlayMode="On"
+                MenuFlyoutPresenterStyle="{StaticResource DefaultMenuFlyoutPresenterStyle}"
+                ShowMode="TransientWithDismissOnPointerMoveAway">
+
+                <MenuFlyoutItem
+                    Text="打开设置"
+                    Style="{StaticResource DefaultMenuFlyoutItemStyle}"
+                    FontSize="15"
+                    Padding="10,6,10,6"
+                    Click="OpenSettings_Click">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" FontSize="18" Glyph="&#xE713;" />
+                    </MenuFlyoutItem.Icon>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem
+                    Text="退出"
+                    Style="{StaticResource DefaultMenuFlyoutItemStyle}"
+                    FontSize="15"
+                    Padding="10,6,10,6"
+                    Click="Exit_Click">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" FontSize="18" Glyph="&#xE7E8;" />
+                    </MenuFlyoutItem.Icon>
+                </MenuFlyoutItem>
+            </MenuFlyout>
+        </tb:TaskbarIcon.ContextFlyout>
+    </tb:TaskbarIcon>
+</UserControl>

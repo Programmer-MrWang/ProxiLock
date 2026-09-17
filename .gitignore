@@ -1,0 +1,15 @@
+# Build output and intermediate files
+bin/
+obj/
+buildbin/
+buildobj/
+_nuget.temp.config
+
+# Rider/IDE workspace metadata
+.idea/
+.vs/
+*.user
+*.suo
+
+# Local smoke-test fixtures
+.smoke-*/

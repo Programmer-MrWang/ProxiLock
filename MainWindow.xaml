@@ -1,0 +1,530 @@
+<Window
+    x:Class="ProxiLock.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:CommunityToolkit.WinUI.Controls"
+    xmlns:local="using:ProxiLock"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid x:Name="RootGrid" Background="Transparent">
+        <NavigationView
+             x:Name="SettingsNavigationView"
+             Background="Transparent"
+             IsBackButtonVisible="Collapsed"
+             IsPaneOpen="True"
+             IsSettingsVisible="False"
+             OpenPaneLength="290"
+             CompactPaneLength="55"
+             PaneDisplayMode="Left"
+             PaneToggleButtonStyle="{StaticResource SettingsPaneToggleButtonStyle}"
+             PaneClosing="SettingsNavigationView_PaneClosing"
+             PaneOpening="SettingsNavigationView_PaneOpening"
+             SelectionChanged="SettingsNavigationView_SelectionChanged">
+            <NavigationView.Resources>
+                 <x:Double x:Key="NavigationViewIconBoxWidth">28</x:Double>
+                <x:Double x:Key="NavigationViewSelectionIndicatorWidth">3</x:Double>
+                <x:Double x:Key="NavigationViewSelectionIndicatorHeight">16</x:Double>
+                <x:Double x:Key="NavigationViewItemOnLeftIconBoxHeight">16</x:Double>
+                <Thickness x:Key="NavigationViewItemContentPresenterMargin">0,0,0,0</Thickness>
+            </NavigationView.Resources>
+            <NavigationView.PaneCustomContent>
+                <Border
+                    x:Name="PaneHeader"
+                    Margin="16,3,16,8"
+                    Padding="12,9"
+                    HorizontalAlignment="Stretch"
+                    Background="{ThemeResource PaneSurfaceBrush}"
+                    CornerRadius="10">
+                    <Grid MinHeight="44">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="52" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Border
+                            Width="40"
+                            Height="40"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Center"
+                            CornerRadius="11"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                            <Image Source="ms-appx:///icon.png" Stretch="Uniform" />
+                        </Border>
+                        <StackPanel
+                            Grid.Column="1"
+                            Margin="6,0,6,0"
+                            VerticalAlignment="Center"
+                            Spacing="0">
+                            <TextBlock
+                                FontSize="16"
+                                FontWeight="SemiBold"
+                                Text="ProxiLock" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                FontSize="11"
+                                Text="隐形锁与自动解锁"
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+                        <Border
+                            x:Name="StatusBadge"
+                            Grid.Column="2"
+                            MinWidth="76"
+                            Padding="8,7"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Center"
+                            Background="{ThemeResource StatusRunningBackgroundBrush}"
+                            CornerRadius="10">
+                            <StackPanel
+                                HorizontalAlignment="Center"
+                                Orientation="Horizontal"
+                                Spacing="6">
+                                <Ellipse
+                                    x:Name="StatusDot"
+                                    Width="8"
+                                    Height="8"
+                                    VerticalAlignment="Center"
+                                    Fill="{ThemeResource StatusRunningForegroundBrush}" />
+                                <TextBlock
+                                    x:Name="StatusText"
+                                    VerticalAlignment="Center"
+                                    FontSize="13"
+                                    Foreground="{ThemeResource StatusRunningForegroundBrush}"
+                                    Text="运行中" />
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                </Border>
+            </NavigationView.PaneCustomContent>
+
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="锁定模式" Tag="Mode" IsSelected="True" FontSize="13" MinHeight="20" Padding="0" Margin="1,3,5,1" HorizontalContentAlignment="Stretch" PointerEntered="NavigationItem_PointerEntered" PointerExited="NavigationItem_PointerExited">
+                    <NavigationViewItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE72E;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="蓝牙" Tag="Bluetooth" FontSize="13" MinHeight="20" Padding="0" Margin="14,0,5,1" HorizontalContentAlignment="Stretch" PointerEntered="NavigationItem_PointerEntered" PointerExited="NavigationItem_PointerExited">
+                    <NavigationViewItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE702;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="U 盘" Tag="Usb" FontSize="13" MinHeight="20" Padding="0" Margin="14,0,5,1" HorizontalContentAlignment="Stretch" PointerEntered="NavigationItem_PointerEntered" PointerExited="NavigationItem_PointerExited">
+                    <NavigationViewItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE8C8;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="空闲锁定" Tag="Idle" FontSize="13" MinHeight="20" Padding="0" Margin="14,0,5,1" HorizontalContentAlignment="Stretch" PointerEntered="NavigationItem_PointerEntered" PointerExited="NavigationItem_PointerExited">
+                    <NavigationViewItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE823;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <NavigationView.FooterMenuItems>
+                <NavigationViewItem Content="通用设置" Tag="General" FontSize="13" MinHeight="20" Padding="0" Margin="1,0,5,7" HorizontalContentAlignment="Stretch" PointerEntered="NavigationItem_PointerEntered" PointerExited="NavigationItem_PointerExited">
+                    <NavigationViewItem.Icon>
+                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE713;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.FooterMenuItems>
+
+            <NavigationView.Content>
+                <ScrollViewer
+                    x:Name="SettingsScrollViewer"
+                    HorizontalScrollBarVisibility="Disabled"
+                    Style="{StaticResource SettingsScrollViewerStyle}"
+                    VerticalScrollBarVisibility="Auto">
+                    <Grid Margin="0,12,0,0" Style="{StaticResource SettingsGridStyle}">
+                        <StackPanel Spacing="{StaticResource SettingsCardSpacing}">
+                            <StackPanel x:Name="ModeSection" Spacing="{StaticResource SettingsCardSpacing}">
+                                <TextBlock
+                                    Text="自动锁定"
+                                    Style="{StaticResource SettingsPageTitleTextBlockStyle}" />
+                                <TextBlock
+                                    Style="{StaticResource SettingsPageDescriptionTextBlockStyle}"
+                                    Text="选择一个触发策略。所有模式都可以使用 Ctrl + Shift + L 解锁。" />
+
+                                <controls:SettingsCard
+                                    Header="锁定模式"
+                                    Description="自动锁定策略彼此互斥，也可以完全关闭。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE72E;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <StackPanel Spacing="4">
+                                        <RadioButton
+                                            x:Name="NoneRadio"
+                                            Content="无自动锁定"
+                                            Tag="None"
+                                            Checked="Mode_Checked" />
+                                        <RadioButton
+                                            x:Name="BluetoothRadio"
+                                            Content="蓝牙信号强度解密"
+                                            Tag="Bluetooth"
+                                            Checked="Mode_Checked" />
+                                        <RadioButton
+                                            x:Name="UsbRadio"
+                                            Content="指定 U 盘解密"
+                                            Tag="Usb"
+                                            Checked="Mode_Checked" />
+                                        <RadioButton
+                                            x:Name="IdleRadio"
+                                            Content="长时间未动电脑加密"
+                                            Tag="Idle"
+                                            Checked="Mode_Checked" />
+                                    </StackPanel>
+                                </controls:SettingsCard>
+
+                                <InfoBar
+                                    x:Name="ModeHintBar"
+                                    IsClosable="False"
+                                    IsOpen="True"
+                                    Severity="Informational"
+                                    Title="未启用自动锁定" />
+                            </StackPanel>
+
+                            <StackPanel x:Name="BluetoothPanel" Spacing="{StaticResource SettingsCardSpacing}">
+                                <TextBlock
+                                    Text="蓝牙"
+                                    Style="{StaticResource SettingsPageTitleTextBlockStyle}" />
+                                <TextBlock
+                                    Style="{StaticResource SettingsPageDescriptionTextBlockStyle}"
+                                    Text="选择一个随身设备作为解锁凭证。设备离开范围或信号低于阈值时自动锁定。" />
+
+                                <controls:SettingsCard
+                                    Header="扫描设备"
+                                    Description="扫描附近可发现的 BLE 广播设备。每次扫描持续 10 秒。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE702;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <!-- A fixed content width is required, not just a minimum:
+                                         SettingsCard lays its content out at its natural width, so
+                                         an unconstrained child (the wrapping summary below) expands
+                                         to its full unwrapped line and squeezes the header/description
+                                         column into a one-character-wide strip. -->
+                                    <Grid Width="460" RowSpacing="12">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock
+                                            VerticalAlignment="Center"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="选择一个设备以配置解锁条件。" />
+                                        <Button
+                                            x:Name="RefreshBluetoothButton"
+                                            Grid.Column="1"
+                                            Click="RefreshBluetooth_Click"
+                                            HorizontalAlignment="Right">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <ProgressRing
+                                                    x:Name="BluetoothScanRing"
+                                                    Width="16"
+                                                    Height="16"
+                                                    IsActive="False"
+                                                    Visibility="Collapsed" />
+                                                <FontIcon
+                                                    x:Name="BluetoothScanIcon"
+                                                    FontFamily="{StaticResource SegoeFluentIcons}"
+                                                    Glyph="&#xE72C;" />
+                                                <TextBlock Text="刷新" />
+                                            </StackPanel>
+                                        </Button>
+                                        <Grid Grid.Row="1" Grid.ColumnSpan="2">
+                                            <ListView
+                                                x:Name="BluetoothList"
+                                                Height="190"
+                                                SelectionChanged="BluetoothList_SelectionChanged"
+                                                SelectionMode="Single">
+                                                <ListView.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Padding="8,6">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="*" />
+                                                                <!-- Fixed width keeps the dBm column aligned
+                                                                     down the list instead of ragging. -->
+                                                                <ColumnDefinition Width="68" />
+                                                                <ColumnDefinition Width="Auto" />
+                                                            </Grid.ColumnDefinitions>
+                                                            <StackPanel
+                                                                Grid.Column="0"
+                                                                Orientation="Horizontal"
+                                                                Spacing="8">
+                                                                <!-- Paired devices are the reliable choice, so
+                                                                     they carry a visible tag. -->
+                                                                <Border
+                                                                    Padding="6,1"
+                                                                    VerticalAlignment="Center"
+                                                                    Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                                                    CornerRadius="4"
+                                                                    Visibility="{Binding IsPaired, Converter={StaticResource BoolToVisibility}}">
+                                                                    <TextBlock
+                                                                        HorizontalAlignment="Center"
+                                                                        FontSize="11"
+                                                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                                        Text="{Binding StatusText}" />
+                                                                </Border>
+                                                                <TextBlock
+                                                                    VerticalAlignment="Center"
+                                                                    Text="{Binding Name}"
+                                                                    TextTrimming="CharacterEllipsis" />
+                                                            </StackPanel>
+                                                            <TextBlock
+                                                                Grid.Column="1"
+                                                                HorizontalAlignment="Right"
+                                                                VerticalAlignment="Center"
+                                                                FontSize="12"
+                                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                                Text="{Binding SignalText}" />
+                                                            <TextBlock
+                                                                Grid.Column="2"
+                                                                Margin="16,0,0,0"
+                                                                HorizontalAlignment="Right"
+                                                                VerticalAlignment="Center"
+                                                                FontFamily="Consolas,Cascadia Mono,monospace"
+                                                                FontSize="12"
+                                                                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                                Text="{Binding Address}" />
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ListView.ItemTemplate>
+                                            </ListView>
+                                            <!-- A silently blank list is indistinguishable from a
+                                                 broken scan, so say what to do next instead. -->
+                                            <StackPanel
+                                                x:Name="BluetoothEmptyState"
+                                                HorizontalAlignment="Center"
+                                                VerticalAlignment="Center"
+                                                Spacing="4"
+                                                Visibility="Collapsed">
+                                                <FontIcon
+                                                    FontFamily="{StaticResource SegoeFluentIcons}"
+                                                    FontSize="22"
+                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                    Glyph="&#xE702;" />
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                    Text="尚未发现设备" />
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    FontSize="12"
+                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                    Text="点击“刷新”开始 10 秒扫描" />
+                                            </StackPanel>
+                                        </Grid>
+                                        <!-- The configured device may simply not be advertising right
+                                             now, in which case it is absent from the list above. State
+                                             it explicitly so an empty list never looks like a lost setting. -->
+                                        <TextBlock
+                                            x:Name="BluetoothSelectionSummary"
+                                            Grid.Row="2"
+                                            Grid.ColumnSpan="2"
+                                            FontSize="12"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            TextWrapping="Wrap" />
+                                    </Grid>
+                                </controls:SettingsCard>
+
+                                <controls:SettingsCard
+                                    Header="信号强度阈值"
+                                    Description="留空表示只要设备可被发现即保持解锁；低于阈值时锁定，高于或等于阈值时解锁。RSSI 范围为 -100 到 -20 dBm。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE957;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <TextBox
+                                        x:Name="BluetoothThresholdBox"
+                                        Width="180"
+                                        HorizontalAlignment="Right"
+                                        Header="RSSI (dBm)"
+                                        PlaceholderText="例如 -70"
+                                        TextChanged="BluetoothThresholdBox_TextChanged" />
+                                </controls:SettingsCard>
+
+                                <!-- Classic Bluetooth hardware reports no RSSI at all, so a
+                                     threshold cannot be measured for it. Saying so avoids
+                                     presenting a setting that would silently do nothing. -->
+                                <InfoBar
+                                    x:Name="BluetoothThresholdHintBar"
+                                    IsClosable="False"
+                                    IsOpen="False"
+                                    Severity="Warning"
+                                    Title="该设备无法测量信号强度" />
+                            </StackPanel>
+
+                            <StackPanel x:Name="UsbPanel" Spacing="{StaticResource SettingsCardSpacing}">
+                                <TextBlock
+                                    Text="U 盘"
+                                    Style="{StaticResource SettingsPageTitleTextBlockStyle}" />
+                                <TextBlock
+                                    Style="{StaticResource SettingsPageDescriptionTextBlockStyle}"
+                                    Text="选择一个物理设备作为解锁凭证。该设备拔出后自动锁定，更换盘符不影响识别。" />
+
+                                <controls:SettingsCard
+                                    Header="扫描设备"
+                                    Description="实时列出当前连接的 U 盘、移动硬盘和读卡器。列表每 5 秒更新。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE8C8;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <!-- Fixed width for the same reason as the Bluetooth card: it
+                                         keeps the header/description column from being squeezed. -->
+                                    <Grid Width="460" RowSpacing="12">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock
+                                            VerticalAlignment="Center"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="选择用于解锁的物理设备。" />
+                                        <Button
+                                            x:Name="RefreshUsbButton"
+                                            Grid.Column="1"
+                                            Click="RefreshUsb_Click"
+                                            HorizontalAlignment="Right">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE72C;" />
+                                                <TextBlock Text="刷新" />
+                                            </StackPanel>
+                                        </Button>
+                                        <Grid Grid.Row="1" Grid.ColumnSpan="2">
+                                            <ListView
+                                                x:Name="UsbList"
+                                                Height="170"
+                                                SelectionChanged="UsbList_SelectionChanged"
+                                                SelectionMode="Single">
+                                                <ListView.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Padding="8,6">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="Auto" />
+                                                                <ColumnDefinition Width="*" />
+                                                            </Grid.ColumnDefinitions>
+                                                            <TextBlock FontWeight="SemiBold" Text="{Binding DriveLetter}" />
+                                                            <TextBlock
+                                                                Grid.Column="1"
+                                                                Margin="18,0,0,0"
+                                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                                Text="{Binding Name}"
+                                                                TextTrimming="CharacterEllipsis" />
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ListView.ItemTemplate>
+                                            </ListView>
+                                            <StackPanel
+                                                x:Name="UsbEmptyState"
+                                                HorizontalAlignment="Center"
+                                                VerticalAlignment="Center"
+                                                Spacing="4"
+                                                Visibility="Collapsed">
+                                                <FontIcon
+                                                    FontFamily="{StaticResource SegoeFluentIcons}"
+                                                    FontSize="22"
+                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                    Glyph="&#xE8C8;" />
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                    Text="未检测到可移动设备" />
+                                                <TextBlock
+                                                    HorizontalAlignment="Center"
+                                                    FontSize="12"
+                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                    Text="插入 U 盘后列表会自动更新" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </Grid>
+                                </controls:SettingsCard>
+
+                                <controls:SettingsCard
+                                    Header="设备实例 ID"
+                                    Description="实例 ID 用于唯一识别物理设备，盘符变化不会影响配置。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE8A5;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <TextBlock
+                                        x:Name="UsbIdText"
+                                        Width="360"
+                                        HorizontalAlignment="Right"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        TextWrapping="Wrap" />
+                                </controls:SettingsCard>
+                            </StackPanel>
+
+                            <StackPanel x:Name="IdlePanel" Spacing="{StaticResource SettingsCardSpacing}">
+                                <TextBlock
+                                    Text="空闲锁定"
+                                    Style="{StaticResource SettingsPageTitleTextBlockStyle}" />
+                                <TextBlock
+                                    Style="{StaticResource SettingsPageDescriptionTextBlockStyle}"
+                                    Text="在离开电脑一段时间后自动锁定。解锁后计时会重新开始。" />
+                                <controls:SettingsCard
+                                    Header="空闲时间"
+                                    Description="超过设定时间没有键盘或鼠标输入后锁定。解锁后会重新开始计时。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE823;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <TextBox
+                                        x:Name="IdleMinutesBox"
+                                        Width="160"
+                                        HorizontalAlignment="Right"
+                                        Header="分钟"
+                                        InputScope="Number"
+                                        Text="5"
+                                        TextChanged="IdleMinutesBox_TextChanged" />
+                                </controls:SettingsCard>
+                            </StackPanel>
+
+                            <StackPanel x:Name="GeneralSection" Spacing="{StaticResource SettingsCardSpacing}">
+                                <TextBlock
+                                    Text="通用设置"
+                                    Style="{StaticResource SettingsPageTitleTextBlockStyle}" />
+                                <TextBlock
+                                    Style="{StaticResource SettingsPageDescriptionTextBlockStyle}"
+                                    Text="启动方式与系统集成。" />
+                                <controls:SettingsCard
+                                    Header="开机自启动"
+                                    Description="登录 Windows 后自动启动 ProxiLock 并在系统托盘运行。"
+                                    >
+                                    <controls:SettingsCard.HeaderIcon>
+                                        <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE7E8;" />
+                                    </controls:SettingsCard.HeaderIcon>
+                                    <CheckBox
+                                        x:Name="AutoStartCheckBox"
+                                        Content="随 Windows 启动"
+                                        HorizontalAlignment="Right"
+                                        Checked="AutoStartCheckBox_Changed"
+                                        Unchecked="AutoStartCheckBox_Changed" />
+                                </controls:SettingsCard>
+                            </StackPanel>
+
+                            <Grid Margin="0,20,0,0">
+                                <TextBlock
+                                    x:Name="SaveStatusText"
+                                    VerticalAlignment="Center"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="修改后会自动保存并应用"
+                                    TextWrapping="Wrap" />
+                            </Grid>
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+            </NavigationView.Content>
+        </NavigationView>
+    </Grid>
+</Window>
