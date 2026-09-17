@@ -488,9 +488,27 @@ public sealed partial class MainWindow : Window
             RadioButton { Tag: "Idle" } => LockMode.Idle,
             _ => LockMode.None
         };
+
+        // The radio changes before the policy is validated, so remember what is actually in
+        // effect. If the edit is rejected (an invalid field for the newly chosen policy), the
+        // selection has to go back: leaving it on a mode the coordinator never adopted makes
+        // the UI claim a lock condition that is not running.
+        var committedMode = _services.Settings?.LockMode ?? LockMode.None;
         UpdateModeUi(mode);
         if (mode == LockMode.Bluetooth) _ = RefreshBluetoothAsync();
-        ApplyCurrentSettings();
+        if (ApplyCurrentSettings()) return;
+
+        using (new SuppressScope(this))
+            SetModeRadio(committedMode);
+        UpdateModeUi(committedMode);
+    }
+
+    private void SetModeRadio(LockMode mode)
+    {
+        NoneRadio.IsChecked = mode == LockMode.None;
+        BluetoothRadio.IsChecked = mode == LockMode.Bluetooth;
+        UsbRadio.IsChecked = mode == LockMode.Usb;
+        IdleRadio.IsChecked = mode == LockMode.Idle;
     }
 
     private void UpdateModeUi(LockMode mode)
@@ -836,9 +854,16 @@ public sealed partial class MainWindow : Window
         _applyTimer.Start();
     }
 
-    private void ApplyCurrentSettings()
+    /// <summary>
+    /// Validates, persists and applies the current editor state.
+    /// </summary>
+    /// <returns>
+    /// True when the settings were accepted and applied. False means the edit was rejected
+    /// (invalid field for the active policy) and the caller must not present it as applied.
+    /// </returns>
+    private bool ApplyCurrentSettings()
     {
-        if (!_initialized || _suppressAutoSave) return;
+        if (!_initialized || _suppressAutoSave) return false;
         // A pending keystroke apply is now redundant.
         _applyTimer.Stop();
 
@@ -851,7 +876,7 @@ public sealed partial class MainWindow : Window
         if (TryParseThreshold(out var parsedThreshold))
             threshold = parsedThreshold;
         else if (mode == LockMode.Bluetooth)
-            return;
+            return false;
 
         var minutes = source.Idle.Minutes;
         if (int.TryParse(IdleMinutesBox.Text, out var parsedMinutes) && parsedMinutes is >= 1 and <= 1440)
@@ -859,7 +884,7 @@ public sealed partial class MainWindow : Window
         else if (mode == LockMode.Idle)
         {
             ShowError("空闲时间必须是 1 到 1440 分钟。");
-            return;
+            return false;
         }
 
         var settings = new AppSettings
@@ -880,16 +905,30 @@ public sealed partial class MainWindow : Window
 
         try
         {
-            _services.Apply(settings);
-            SaveStatusText.Text = "已自动保存并应用";
-            SaveStatusText.Foreground = ThemeBrush("SaveSucceededForegroundBrush");
+            var result = _services.Apply(settings);
+            if (result.AutoStartApplied)
+            {
+                SaveStatusText.Text = "已自动保存并应用";
+                SaveStatusText.Foreground = ThemeBrush("SaveSucceededForegroundBrush");
+            }
+            else
+            {
+                // The policy is saved, but the registry could not be updated. Saying
+                // "applied" here would hide that autostart is not actually configured.
+                SaveStatusText.Text = settings.AutoStart
+                    ? "设置已保存，但开机自启动未能写入注册表，请检查系统策略。"
+                    : "设置已保存，但开机自启动项未能从注册表移除。";
+                SaveStatusText.Foreground = ThemeBrush("SaveFailedForegroundBrush");
+            }
             // Choosing a device satisfies the policy's prerequisite, so the warning
             // in the hint bar has to be re-evaluated after the settings are applied.
             UpdateModeUi(mode);
+            return true;
         }
         catch (Exception ex)
         {
             ShowError($"自动保存失败：{ex.Message}");
+            return false;
         }
     }
 
