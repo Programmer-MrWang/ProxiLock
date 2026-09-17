@@ -8,6 +8,37 @@ namespace ProxiLock.Services;
 public enum BluetoothPresence { Unknown, Present, Absent }
 
 /// <summary>
+/// Why <see cref="BluetoothMonitor.Evaluate"/> reached its verdict. Callers need this to
+/// explain the state honestly: "connected but the signal is too weak" and "not connected"
+/// both report <see cref="BluetoothPresence.Absent"/>, but they mean different things to the
+/// user, and the same verdict also implies something different while a manual unlock is held.
+/// </summary>
+public enum BluetoothReason
+{
+    /// <summary>The radio has not produced a single advertisement yet; nothing can be concluded.</summary>
+    ScanIncomplete,
+    /// <summary>The radio is working but the configured device has never been observed.</summary>
+    NeverObserved,
+    /// <summary>Advertising recently, with no threshold configured to compare against.</summary>
+    Advertised,
+    /// <summary>Reported connected by the connection poll.</summary>
+    Connected,
+    /// <summary>Paired but neither connected nor advertising for a conclusive period.</summary>
+    NotConnected,
+    /// <summary>Signal read at or above the configured threshold.</summary>
+    SignalAboveThreshold,
+    /// <summary>Signal read below the configured threshold.</summary>
+    SignalBelowThreshold,
+    /// <summary>Signal sits inside the hysteresis band, so the previous verdict is held.</summary>
+    SignalInHysteresis,
+    /// <summary>A threshold is configured but no recent measurement exists to apply it to.</summary>
+    NoRecentSignal
+}
+
+/// <summary>A presence verdict together with the evidence it was based on.</summary>
+public readonly record struct BluetoothStatus(BluetoothPresence Presence, BluetoothReason Reason);
+
+/// <summary>
 /// One device the user can choose from. Deliberately a plain immutable record: the
 /// Bluetooth callbacks run on background threads, and XAML bindings may only be updated
 /// on the UI thread, so the monitor never hands out bound objects directly.
@@ -46,6 +77,15 @@ public sealed class BluetoothMonitor : IDisposable
 
     private static readonly TimeSpan PairedRefreshInterval = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan ConnectionPollInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// How long a connection reading stays valid evidence. The poll runs every three
+    /// seconds, so this tolerates several missed reads before the connection stops counting.
+    /// Without an expiry a device that was connected when the radio reset would look
+    /// connected forever, and a device that left would keep the screen unlocked.
+    /// </summary>
+    private static readonly TimeSpan ConnectionStatusWindow = TimeSpan.FromSeconds(15);
+
     private static readonly TimeSpan NameLookupTimeout = TimeSpan.FromSeconds(4);
 
     /// <summary>
@@ -66,10 +106,22 @@ public sealed class BluetoothMonitor : IDisposable
     {
         public string? Name;
         public short Rssi = RssiUnknown;
-        public DateTimeOffset? LastSeen;
         public bool IsPaired;
         public bool Connected;
         public bool RandomAddress;
+
+        /// <summary>When the last BLE advertisement arrived. Never touched by the connection poll.</summary>
+        public DateTimeOffset? AdvertisedAt;
+
+        /// <summary>
+        /// When <see cref="Rssi"/> was last measured. Kept separate from
+        /// <see cref="AdvertisedAt"/> and from the connection poll so a stale reading can
+        /// never be presented as a fresh distance measurement.
+        /// </summary>
+        public DateTimeOffset? RssiAt;
+
+        /// <summary>When <see cref="Connected"/> was last successfully read.</summary>
+        public DateTimeOffset? ConnectionStatusAt;
 
         /// <summary>
         /// Set once an advertisement has ever carried a signal reading. Distinguishes "no
@@ -105,10 +157,28 @@ public sealed class BluetoothMonitor : IDisposable
     private BluetoothLEAdvertisementWatcher? _watcher;
     private Timer? _pairedTimer;
     private Timer? _connectionTimer;
+    /// <summary>
+    /// Cancels in-flight radio work. Written under <see cref="_gate"/> and read by timer
+    /// callbacks off-thread, so it is volatile; it is deliberately never disposed (see
+    /// <see cref="Stop"/>).
+    /// </summary>
+    private volatile CancellationTokenSource? _lifetime;
     private int _pairedRefreshRunning;
     private int _connectionPollRunning;
+    private int _watcherRestartRunning;
     private volatile bool _hasScanned;
+    private volatile bool _active;
     private bool _disposed;
+
+    /// <summary>When any advertisement was last received, from any device.</summary>
+    private DateTimeOffset? _lastAnyAdvertisementAt;
+
+    /// <summary>
+    /// The device the policy is currently watching. It is exempt from cache eviction:
+    /// dropping the entry would erase the only evidence the monitor has about the device the
+    /// user chose, leaving the lock stuck in "unknown".
+    /// </summary>
+    private ulong? _pinnedAddress;
 
     /// <summary>
     /// True once any advertisement has been received or a paired device has been listed.
@@ -120,18 +190,11 @@ public sealed class BluetoothMonitor : IDisposable
     public void Start()
     {
         if (_disposed) return;
-        if (_watcher is null)
+        _active = true;
+        lock (_gate)
         {
-            try
-            {
-                _watcher = new BluetoothLEAdvertisementWatcher { ScanningMode = BluetoothLEScanningMode.Active };
-                _watcher.Received += OnReceived;
-                _watcher.Start();
-            }
-            catch
-            {
-                _watcher = null;
-            }
+            _lifetime ??= new CancellationTokenSource();
+            EnsureWatcher();
         }
 
         // Paired devices are filtered out of the picker until they are actually connected.
@@ -141,13 +204,96 @@ public sealed class BluetoothMonitor : IDisposable
         _connectionTimer ??= new Timer(_ => PollConnectionStatusAsync(), null, TimeSpan.Zero, ConnectionPollInterval);
     }
 
+    /// <summary>
+    /// Starts the BLE watcher if it is not running. A watcher that the system already
+    /// aborted (radio toggled off, adapter reset) is not reused: the object survives with a
+    /// non-running status, so checking for null alone would leave the radio silent forever.
+    /// </summary>
+    private void EnsureWatcher()
+    {
+        if (_disposed) return;
+        if (_watcher is not null && _watcher.Status is BluetoothLEAdvertisementWatcherStatus.Started)
+            return;
+
+        DetachWatcher();
+
+        try
+        {
+            var watcher = new BluetoothLEAdvertisementWatcher { ScanningMode = BluetoothLEScanningMode.Active };
+            watcher.Received += OnReceived;
+            watcher.Stopped += OnWatcherStopped;
+            watcher.Start();
+            _watcher = watcher;
+        }
+        catch
+        {
+            // A missing or disabled radio simply yields no advertisements.
+            _watcher = null;
+        }
+    }
+
+    private void DetachWatcher()
+    {
+        var watcher = _watcher;
+        _watcher = null;
+        if (watcher is null) return;
+        watcher.Received -= OnReceived;
+        watcher.Stopped -= OnWatcherStopped;
+        try { watcher.Stop(); } catch { }
+    }
+
+    /// <summary>
+    /// Recreates the watcher after the radio stops it, which happens when Bluetooth is
+    /// turned off and on again or the adapter resets. Without this the policy would keep
+    /// evaluating against a scan that silently ended.
+    /// </summary>
+    private void OnWatcherStopped(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementWatcherStoppedEventArgs args)
+    {
+        CancellationTokenSource? lifetime;
+        lock (_gate)
+        {
+            if (ReferenceEquals(_watcher, sender)) _watcher = null;
+            lifetime = _lifetime;
+        }
+
+        if (!_active || _disposed || lifetime is null) return;
+        if (Interlocked.Exchange(ref _watcherRestartRunning, 1) != 0) return;
+
+        var token = lifetime.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Give the radio a moment to settle before rebuilding the watcher.
+                await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
+                // Stop may have run during the delay; rebuilding then would resurrect a
+                // watcher the caller had already released.
+                if (!_active || _disposed || token.IsCancellationRequested) return;
+                lock (_gate) EnsureWatcher();
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+            finally
+            {
+                Interlocked.Exchange(ref _watcherRestartRunning, 0);
+            }
+        }, token);
+    }
+
     public void Stop()
     {
-        if (_watcher is not null)
+        _active = false;
+        lock (_gate)
         {
-            _watcher.Received -= OnReceived;
-            try { _watcher.Stop(); } catch { }
-            _watcher = null;
+            DetachWatcher();
+
+            // The token source is cancelled but intentionally not disposed: callbacks and
+            // polling work that already captured it may still read Token, and reading it
+            // after disposal throws. Nothing here uses CancelAfter, so there is no timer to
+            // free. A fresh source is created the next time Start runs.
+            var lifetime = _lifetime;
+            _lifetime = null;
+            try { lifetime?.Cancel(); } catch { }
         }
 
         var paired = _pairedTimer;
@@ -178,7 +324,7 @@ public sealed class BluetoothMonitor : IDisposable
             {
                 if (!_states.TryGetValue(address, out var state)) continue;
 
-                var advertised = state.LastSeen is { } seen && now - seen <= AbsentWindow;
+                var advertised = state.AdvertisedAt is { } seen && now - seen <= AbsentWindow;
                 if (!advertised && !state.IsPaired) continue;
 
                 result.Add(new BluetoothObservation(
@@ -186,7 +332,7 @@ public sealed class BluetoothMonitor : IDisposable
                     state.Name,
                     state.Rssi,
                     state.IsPaired,
-                    state.IsPaired && state.Connected,
+                    state.IsPaired && ConnectionFresh(state, now),
                     state.RandomAddress));
             }
 
@@ -210,65 +356,116 @@ public sealed class BluetoothMonitor : IDisposable
     /// A configured threshold is the authority whenever a real signal reading exists, and
     /// that includes a connected device: connection proves the device is here, but it says
     /// nothing about distance, so it must never override an explicit proximity requirement.
-    /// When no signal reading is available (classic Bluetooth hardware reports no RSSI at
-    /// all) the threshold simply cannot be evaluated, and presence falls back to the
-    /// connection/advertisement evidence. The UI reports that limitation rather than
-    /// silently dropping the check.
+    /// A reading is only usable while it is fresh; once the device stops advertising, a
+    /// threshold can no longer be evaluated and the previous verdict is held until the
+    /// silence becomes conclusive. When no reading is ever available (classic Bluetooth
+    /// hardware reports no RSSI at all) presence falls back to the connection/advertisement
+    /// evidence, and the UI reports that limitation rather than silently dropping the check.
     /// </remarks>
-    public BluetoothPresence Evaluate(string? address, int? threshold)
+    public BluetoothStatus Evaluate(string? address, int? threshold)
     {
-        if (!TryParseAddress(address, out var value)) return BluetoothPresence.Unknown;
+        if (!TryParseAddress(address, out var value))
+            return new BluetoothStatus(BluetoothPresence.Unknown, BluetoothReason.ScanIncomplete);
 
         var now = DateTimeOffset.UtcNow;
         lock (_gate)
         {
+            // Watch the configured device so eviction cannot discard it.
+            _pinnedAddress = value;
+
             if (!_states.TryGetValue(value, out var state))
-                return BluetoothPresence.Unknown;
-
-            var seenRecently = state.LastSeen is { } seen && now - seen <= PresentWindow;
-            // Silence long enough to be conclusive. Between the two windows the previous
-            // decision is retained, which is what removes the flicker.
-            var silentConclusively = state.LastSeen is null || now - state.LastSeen.Value >= AbsentWindow;
-            var connected = state.IsPaired && state.Connected;
-
-            // Threshold mode. Connection is deliberately not consulted first here, because a
-            // connected device whose signal has faded should still lock.
-            if (threshold is int limit && state.Rssi != RssiUnknown && seenRecently)
             {
+                // Never observed. Once the radio is demonstrably working (advertisements
+                // from other devices are arriving) the configured device is genuinely away.
+                // Before the first advertisement there is nothing to conclude, which keeps
+                // startup from locking on an empty cache.
+                var radioLive = _lastAnyAdvertisementAt is { } any && now - any <= AbsentWindow;
+                return radioLive
+                    ? new BluetoothStatus(BluetoothPresence.Absent, BluetoothReason.NeverObserved)
+                    : new BluetoothStatus(BluetoothPresence.Unknown, BluetoothReason.ScanIncomplete);
+            }
+
+            var advertised = state.AdvertisedAt is { } seen && now - seen <= PresentWindow;
+            var connected = state.IsPaired && ConnectionFresh(state, now);
+            var measurementMinutes = state.RssiAt is { } measured && now - measured <= PresentWindow && state.Rssi != RssiUnknown;
+            var silenceConclusive = LastEvidence(state) is not { } evidence || now - evidence >= AbsentWindow;
+
+            // Threshold mode. Only a fresh measurement can decide it: a signed-out reading or
+            // a connection alone cannot stand in for distance.
+            if (threshold is int limit && state.HasReportedRssi)
+            {
+                if (!measurementMinutes)
+                {
+                    if (silenceConclusive)
+                    {
+                        state.LastPresent = false;
+                        return new BluetoothStatus(BluetoothPresence.Absent, BluetoothReason.NoRecentSignal);
+                    }
+                    return Held(state, BluetoothReason.NoRecentSignal);
+                }
+
                 if (state.Rssi >= limit)
                 {
                     state.LastPresent = true;
-                    return BluetoothPresence.Present;
+                    return new BluetoothStatus(BluetoothPresence.Present, BluetoothReason.SignalAboveThreshold);
                 }
 
                 if (state.Rssi <= limit - RssiHysteresisDb)
                 {
                     state.LastPresent = false;
-                    return BluetoothPresence.Absent;
+                    return new BluetoothStatus(BluetoothPresence.Absent, BluetoothReason.SignalBelowThreshold);
                 }
 
                 // Inside the hysteresis band: hold the previous verdict.
-                return state.LastPresent == true ? BluetoothPresence.Present : BluetoothPresence.Absent;
+                return Held(state, BluetoothReason.SignalInHysteresis);
             }
 
             // No usable signal reading. A live connection is direct evidence that the device
             // is here, which is the best available answer for hardware that reports no RSSI.
-            if (connected || seenRecently)
+            if (connected || advertised)
             {
                 state.LastPresent = true;
-                return BluetoothPresence.Present;
+                return new BluetoothStatus(BluetoothPresence.Present, connected ? BluetoothReason.Connected : BluetoothReason.Advertised);
             }
 
             // Not currently evidenced. Only call it absent once the silence is conclusive,
             // otherwise keep the last answer so a slow advertiser does not flap the lock.
-            if (silentConclusively)
+            if (silenceConclusive)
             {
                 state.LastPresent = false;
-                return BluetoothPresence.Absent;
+                return new BluetoothStatus(BluetoothPresence.Absent, BluetoothReason.NotConnected);
             }
 
-            return state.LastPresent == true ? BluetoothPresence.Present : BluetoothPresence.Unknown;
+            return Held(state, BluetoothReason.NoRecentSignal);
         }
+
+        // Between the two windows there is no new evidence, so the previous verdict stands.
+        static BluetoothStatus Held(State state, BluetoothReason reason) => state.LastPresent switch
+        {
+            true => new BluetoothStatus(BluetoothPresence.Present, reason),
+            false => new BluetoothStatus(BluetoothPresence.Absent, reason),
+            _ => new BluetoothStatus(BluetoothPresence.Unknown, reason)
+        };
+    }
+
+    /// <summary>
+    /// True when <c>Connected</c> was read recently enough to be treated as current. The
+    /// timestamp is only advanced by a successful poll, so a radio that stops answering
+    /// ages out instead of pinning the device as present.
+    /// </summary>
+    private static bool ConnectionFresh(State state, DateTimeOffset now)
+        => state.Connected
+           && state.ConnectionStatusAt is { } read
+           && now - read <= ConnectionStatusWindow;
+
+    /// <summary>The most recent moment the device gave any sign of being present.</summary>
+    private static DateTimeOffset? LastEvidence(State state)
+    {
+        var advertised = state.AdvertisedAt;
+        var connectedAt = state.Connected ? state.ConnectionStatusAt : null;
+        if (advertised is null) return connectedAt;
+        if (connectedAt is null) return advertised;
+        return advertised > connectedAt ? advertised : connectedAt;
     }
 
     /// <summary>
@@ -324,8 +521,11 @@ public sealed class BluetoothMonitor : IDisposable
             else if (_resolvedNames.TryGetValue(address, out var resolved) && !string.IsNullOrWhiteSpace(resolved))
                 state.Name = resolved;
 
+            var now = DateTimeOffset.UtcNow;
             state.Rssi = args.RawSignalStrengthInDBm;
-            state.LastSeen = DateTimeOffset.UtcNow;
+            state.AdvertisedAt = now;
+            state.RssiAt = now;
+            _lastAnyAdvertisementAt = now;
             // BLE reports -127 for "unknown", so only a real reading proves this hardware
             // can be measured against a threshold at all.
             if (state.Rssi != RssiUnknown) state.HasReportedRssi = true;
@@ -421,37 +621,45 @@ public sealed class BluetoothMonitor : IDisposable
         if (Interlocked.Exchange(ref _connectionPollRunning, 1) != 0) return;
         try
         {
+            var token = _lifetime?.Token ?? CancellationToken.None;
             List<(ulong Address, PairedHandle Handle)> handles;
             lock (_gate) handles = _handles.Select(pair => (pair.Key, pair.Value)).ToList();
 
             foreach (var (address, handle) in handles)
             {
+                if (token.IsCancellationRequested) break;
                 try
                 {
                     if (handle.IsLowEnergy)
                     {
-                        handle.LowEnergy ??= await CreateLowEnergyAsync(address).ConfigureAwait(false);
+                        handle.LowEnergy ??= await CreateLowEnergyAsync(address, token).ConfigureAwait(false);
                         if (handle.LowEnergy is null) continue;
                         Record(address, handle.LowEnergy.ConnectionStatus == BluetoothConnectionStatus.Connected, handle.LowEnergy.Name);
                     }
                     else
                     {
-                        handle.Classic ??= await CreateClassicAsync(address).ConfigureAwait(false);
+                        handle.Classic ??= await CreateClassicAsync(address, token).ConfigureAwait(false);
                         if (handle.Classic is null) continue;
                         Record(address, handle.Classic.ConnectionStatus == BluetoothConnectionStatus.Connected, handle.Classic.Name);
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
                 catch
                 {
                     // A handle can become invalid when the radio resets or the device is
-                    // removed; drop it so the next paired refresh recreates it.
-                    lock (_gate) _handles.Remove(address);
+                    // removed. Drop it so the next paired refresh recreates it; the
+                    // connection reading then ages out instead of pinning the device present.
+                    DropHandle(address);
                 }
             }
         }
+        catch (OperationCanceledException) { }
         catch
         {
-            // Polling is best-effort; the previous readings stay in place.
+            // Polling is best-effort; the previous readings age out on their own.
         }
         finally
         {
@@ -459,20 +667,51 @@ public sealed class BluetoothMonitor : IDisposable
         }
     }
 
-    private static async Task<BluetoothDevice?> CreateClassicAsync(ulong address)
+    private void DropHandle(ulong address)
     {
-        var task = BluetoothDevice.FromBluetoothAddressAsync(address).AsTask();
-        return await Task.WhenAny(task, Task.Delay(DeviceCallTimeout)).ConfigureAwait(false) == task
-            ? await task.ConfigureAwait(false)
-            : null;
+        PairedHandle? handle;
+        lock (_gate)
+        {
+            if (!_handles.TryGetValue(address, out handle)) return;
+            _handles.Remove(address);
+            // A device that is no longer readable is still paired, so its state (and name)
+            // stays; only the connection reading is invalidated.
+            if (_states.TryGetValue(address, out var state))
+                state.Connected = false;
+        }
+
+        try { handle.Classic?.Dispose(); } catch { }
+        try { handle.LowEnergy?.Dispose(); } catch { }
     }
 
-    private static async Task<BluetoothLEDevice?> CreateLowEnergyAsync(ulong address)
+    private static async Task<BluetoothDevice?> CreateClassicAsync(ulong address, CancellationToken token)
     {
-        var task = BluetoothLEDevice.FromBluetoothAddressAsync(address).AsTask();
-        return await Task.WhenAny(task, Task.Delay(DeviceCallTimeout)).ConfigureAwait(false) == task
-            ? await task.ConfigureAwait(false)
-            : null;
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(DeviceCallTimeout);
+            return await BluetoothDevice.FromBluetoothAddressAsync(address).AsTask(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelling the operation also rejects the pending projection, so an object
+            // that arrives late is released instead of leaking outside the caller.
+            return null;
+        }
+    }
+
+    private static async Task<BluetoothLEDevice?> CreateLowEnergyAsync(ulong address, CancellationToken token)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(DeviceCallTimeout);
+            return await BluetoothLEDevice.FromBluetoothAddressAsync(address).AsTask(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
     }
 
     private void Record(ulong address, bool connected, string? name)
@@ -481,9 +720,9 @@ public sealed class BluetoothMonitor : IDisposable
         {
             if (!_states.TryGetValue(address, out var state)) return;
             state.Connected = connected;
-            // A live connection proves presence, which is what lets headphones and other
-            // non-advertising hardware serve as an unlock credential.
-            if (connected) state.LastSeen = DateTimeOffset.UtcNow;
+            // Only a successful read stamps this, which is what lets a stale "connected"
+            // expire when the radio stops answering.
+            state.ConnectionStatusAt = DateTimeOffset.UtcNow;
             if (string.IsNullOrWhiteSpace(state.Name) && !string.IsNullOrWhiteSpace(name))
                 state.Name = name;
         }
@@ -533,15 +772,19 @@ public sealed class BluetoothMonitor : IDisposable
     private async Task ResolveNameAsync(ulong address)
     {
         string? name = null;
+        BluetoothLEDevice? device = null;
         try
         {
-            var lookup = BluetoothLEDevice.FromBluetoothAddressAsync(address).AsTask();
-            if (await Task.WhenAny(lookup, Task.Delay(NameLookupTimeout)).ConfigureAwait(false) == lookup)
-            {
-                using var device = await lookup.ConfigureAwait(false);
-                if (device is not null && !string.IsNullOrWhiteSpace(device.Name))
-                    name = device.Name;
-            }
+            var token = _lifetime?.Token ?? CancellationToken.None;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(NameLookupTimeout);
+            device = await BluetoothLEDevice.FromBluetoothAddressAsync(address).AsTask(timeout.Token).ConfigureAwait(false);
+            if (device is not null && !string.IsNullOrWhiteSpace(device.Name))
+                name = device.Name;
+        }
+        catch (OperationCanceledException)
+        {
+            // Best-effort: an unnamed device still works as an unlock credential.
         }
         catch
         {
@@ -558,16 +801,23 @@ public sealed class BluetoothMonitor : IDisposable
                 if (!string.IsNullOrWhiteSpace(name) && _states.TryGetValue(address, out var state))
                     state.Name = name;
             }
+
+            try { device?.Dispose(); } catch { }
         }
     }
 
-    /// <summary>Keeps tracked devices bounded by dropping the least recently seen.</summary>
+    /// <summary>
+    /// Keeps tracked devices bounded by dropping the least recently seen. The device the
+    /// policy is watching is never dropped, and paired devices are kept so the picker does
+    /// not lose hardware the user has deliberately set up.
+    /// </summary>
     private void Evict()
     {
         while (_order.Count > 150)
         {
             var oldest = _order.FirstOrDefault(address =>
-                !(_states.TryGetValue(address, out var state) && state.IsPaired));
+                address != _pinnedAddress
+                && !(_states.TryGetValue(address, out var state) && state.IsPaired));
             if (oldest == 0) break;
             _order.Remove(oldest);
             _states.Remove(oldest);
@@ -610,6 +860,7 @@ public sealed class BluetoothMonitor : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _active = false;
         Stop();
 
         List<PairedHandle> handles;
@@ -627,6 +878,7 @@ public sealed class BluetoothMonitor : IDisposable
             _states.Clear();
             _order.Clear();
             _resolvedNames.Clear();
+            _nameLookupsInFlight.Clear();
         }
     }
 }

@@ -37,12 +37,33 @@ public sealed class LockCoordinator : IDisposable
     private DateTimeOffset? _bluetoothAbsentSince;
     private uint _lastInputTick;
     private volatile LockReason _manualUnlockOverride;
+    private BluetoothStatus _bluetoothStatus = new(BluetoothPresence.Unknown, BluetoothReason.ScanIncomplete);
     private volatile bool _armed;
     private volatile bool _disposed;
 
     public bool IsLocked => _overlays.IsVisible;
     public BluetoothMonitor Bluetooth => _bluetooth;
     public UsbMonitor Usb => _usb;
+
+    /// <summary>
+    /// The most recent Bluetooth verdict and the evidence behind it. The settings page
+    /// reports this rather than inferring a reason from the presence value alone, so
+    /// "connected but the signal is too weak" is never described as "not connected".
+    /// </summary>
+    /// <remarks>
+    /// Guarded by <see cref="_settingsGate"/> rather than marked volatile: a struct cannot be
+    /// volatile, and this is written by the monitor thread and read by the UI thread.
+    /// </remarks>
+    public BluetoothStatus BluetoothStatus
+    {
+        get { lock (_settingsGate) return _bluetoothStatus; }
+    }
+
+    /// <summary>
+    /// The condition the user manually unlocked from, if the device has not since been seen
+    /// healthy. The UI uses this to explain why the lock is not re-engaging.
+    /// </summary>
+    public LockReason ManualUnlockOverride => _manualUnlockOverride;
 
     public event EventHandler<bool>? LockStateChanged;
 
@@ -252,10 +273,19 @@ public sealed class LockCoordinator : IDisposable
         AppSettings settings;
         lock (_settingsGate) settings = _settings;
 
+        // Evaluate the configured device on every tick, not only while the Bluetooth policy
+        // is active. The settings page reports this verdict, and it must describe the device
+        // the user is looking at rather than a stale value from whenever the policy last ran.
+        // Evaluating once here also keeps the hysteresis state advancing consistently.
+        var bluetoothStatus = string.IsNullOrWhiteSpace(settings.Bluetooth.DeviceAddress)
+            ? new BluetoothStatus(BluetoothPresence.Unknown, BluetoothReason.ScanIncomplete)
+            : _bluetooth.Evaluate(settings.Bluetooth.DeviceAddress, settings.Bluetooth.Threshold);
+        lock (_settingsGate) _bluetoothStatus = bluetoothStatus;
+
         switch (settings.LockMode)
         {
             case LockMode.Bluetooth:
-                EvaluateBluetooth(settings);
+                EvaluateBluetooth(settings, bluetoothStatus);
                 break;
             case LockMode.Usb:
                 if (string.IsNullOrWhiteSpace(settings.Usb.DeviceInstanceId)) break;
@@ -279,19 +309,14 @@ public sealed class LockCoordinator : IDisposable
         }
     }
 
-    private void EvaluateBluetooth(AppSettings settings)
+    private void EvaluateBluetooth(AppSettings settings, BluetoothStatus status)
     {
         // A Bluetooth policy without a selected device is incomplete. Treat it
         // as a no-op instead of locking a fresh install into an unresolvable state.
-        if (string.IsNullOrWhiteSpace(settings.Bluetooth.DeviceAddress)) return;
+        if (string.IsNullOrWhiteSpace(settings.Bluetooth.DeviceAddress))
+            return;
 
-        // A tri-state answer matters here: "not currently observed" is not the same as
-        // "known to be away". Treating the former as away locked the screen whenever a
-        // device went quiet for one tick, which produced a lock/unlock loop.
-        var presence = _bluetooth.Evaluate(settings.Bluetooth.DeviceAddress, settings.Bluetooth.Threshold);
-        var absent = presence == BluetoothPresence.Absent;
-
-        switch (presence)
+        switch (status.Presence)
         {
             case BluetoothPresence.Present:
                 // The device is back, so a previous manual unlock no longer applies.

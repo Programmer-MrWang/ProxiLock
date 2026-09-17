@@ -694,28 +694,57 @@ public sealed partial class MainWindow : Window
         }
 
         var thresholdActive = threshold is int;
-        switch (monitor.Evaluate(configuredAddress, threshold))
+        var status = _services.LockCoordinator.BluetoothStatus;
+        var manualOverride = _services.LockCoordinator.ManualUnlockOverride == LockReason.Bluetooth;
+
+        // A manual unlock is held until the device is next seen healthy. Reporting the
+        // ordinary verdict in that state would claim "will lock" while the policy is
+        // deliberately not re-engaging.
+        if (manualOverride && status.Presence != BluetoothPresence.Present)
+        {
+            BluetoothSelectionSummary.Text = $"已选择：{label}，已手动解锁，设备重新被检测到之前不会重复锁定。";
+            return;
+        }
+
+        switch (status.Presence)
         {
             case BluetoothPresence.Present:
-                BluetoothSelectionSummary.Text = thresholdActive && monitor.SupportsRssi(configuredAddress)
-                    ? $"已选择：{label}，信号高于阈值 {threshold} dBm，保持解锁。"
-                    : $"已选择：{label}，当前在范围内，保持解锁。";
+                BluetoothSelectionSummary.Text = status.Reason switch
+                {
+                    BluetoothReason.SignalAboveThreshold => $"已选择：{label}，信号高于或等于阈值 {threshold} dBm，保持解锁。",
+                    BluetoothReason.Connected => $"已选择：{label}，设备已连接，保持解锁。",
+                    _ => thresholdActive && monitor.SupportsRssi(configuredAddress)
+                        ? $"已选择：{label}，信号在阈值附近，按上次判定保持解锁。"
+                        : $"已选择：{label}，当前在范围内，保持解锁。"
+                };
                 break;
+
             case BluetoothPresence.Absent:
-                // "Not connected" and "out of range" are different situations and the user
-                // can act on them differently, so they are not conflated here.
-                BluetoothSelectionSummary.Text = monitor.IsPaired(configuredAddress)
-                    ? $"已选择：{label}，设备未连接（可能已关机或休眠），将保持锁定。"
-                    : thresholdActive
+                // The monitor reports why it decided this. "Connected but too weak" and
+                // "not connected" both read as Absent, but they describe opposite situations
+                // and the user would act on them differently.
+                BluetoothSelectionSummary.Text = status.Reason switch
+                {
+                    BluetoothReason.SignalBelowThreshold =>
+                        $"已选择：{label}，信号低于阈值 {threshold} dBm，将保持锁定。",
+                    BluetoothReason.NoRecentSignal =>
+                        $"已选择：{label}，已有一段时间没有读到信号，将保持锁定。",
+                    BluetoothReason.NeverObserved =>
+                        $"已选择：{label}，附近没有检测到该设备，将保持锁定。",
+                    BluetoothReason.NotConnected when monitor.IsPaired(configuredAddress) =>
+                        $"已选择：{label}，设备未连接（可能已关机或休眠），将保持锁定。",
+                    _ => thresholdActive
                         ? $"已选择：{label}，信号低于阈值 {threshold} dBm，将保持锁定。"
-                        : $"已选择：{label}，当前不在范围内，将保持锁定。";
+                        : $"已选择：{label}，当前不在范围内，将保持锁定。"
+                };
                 break;
+
             default:
-                BluetoothSelectionSummary.Text = monitor.HasScanned
-                    // Not the same as "away": the device may simply be quiet right now, and
-                    // saying "out of range" here would be wrong and alarming.
-                    ? $"已选择：{label}，暂时没有读到信号，锁定状态保持不变。"
-                    : $"已选择：{label}，等待扫描以确认状态。";
+                BluetoothSelectionSummary.Text = status.Reason == BluetoothReason.ScanIncomplete || !monitor.HasScanned
+                    // Not the same as "away": the radio may simply not have produced data yet,
+                    // and saying "out of range" here would be wrong and alarming.
+                    ? $"已选择：{label}，等待扫描以确认状态。"
+                    : $"已选择：{label}，暂时没有读到信号，锁定状态保持不变。";
                 break;
         }
     }
