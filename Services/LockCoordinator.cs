@@ -112,23 +112,30 @@ public sealed class LockCoordinator : IDisposable
     public void ApplySettings(AppSettings settings, bool persist = true)
     {
         var normalized = Normalize(settings);
-        LockMode previousMode;
+
         AppSettings previous;
-        lock (_settingsGate)
-        {
-            previous = _settings;
-            previousMode = _settings.LockMode;
-            _settings = normalized;
-        }
+        lock (_settingsGate) previous = _settings;
 
         // Settings are re-applied on every keystroke in the text fields. Skipping
         // identical values avoids rewriting the config and restarting the BLE
         // watcher (a stop/start cycle) for input that changed nothing.
         var changed = !AreEquivalent(previous, normalized);
+
+        // Persist before publishing the new settings. If the write fails the exception
+        // reaches the caller, the running configuration still matches what is on disk, and
+        // the next attempt is still seen as a change instead of being skipped as a no-op.
+        if (changed && persist)
+            _store.Save(normalized);
+
+        LockMode previousMode;
+        lock (_settingsGate)
+        {
+            previousMode = _settings.LockMode;
+            _settings = normalized;
+        }
+
         if (changed)
         {
-            if (persist)
-                _store.Save(normalized);
             _manualUnlockOverride = LockReason.None;
             // A newly selected device must start its confirmation window fresh rather than
             // inheriting the previous device's absence.
