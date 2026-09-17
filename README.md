@@ -4,7 +4,7 @@ ProxiLock 是一个 WinUI 3 隐形锁工具：程序常驻系统托盘，按蓝�
 
 ## 构建
 
-要求 .NET 10 SDK、Windows 10 1809+ 和 Windows App SDK。项目默认固定为 Windows App SDK 支持的 `x64/win-x64` 架构，直接执行下面的命令即可，无需额外传入 `-p:Platform=x64`。
+要求 .NET 10 SDK、Windows 10 2004（内部版本 19041）+ 和 Windows App SDK。项目默认固定为 Windows App SDK 支持的 `x64/win-x64` 架构，直接执行下面的命令即可，无需额外传入 `-p:Platform=x64`。
 
 ```powershell
 dotnet build ProxiLock.csproj -c Release
@@ -16,8 +16,8 @@ dotnet publish ProxiLock.csproj -c Release -r win-x64 --self-contained true `
 
 ## 说明
 
-- 蓝牙监控使用 `BluetoothLEAdvertisementWatcher`，RSSI 阈值按 dBm 比较，设备连续 3 秒没有广播视为离线。
-- U 盘列表枚举当前可移动盘，优先保存 WMI 暴露的 `PNPDeviceID`，不可用时回退到卷序列号。扫描在后台线程执行，避免阻塞设置界面。
+- 蓝牙监控使用 `BluetoothLEAdvertisementWatcher`，并同时读取已配对设备的连接状态。判定分两层：设备 20 秒没有广播即视为“已离开”，但要真正触发锁定还需再持续缺席 5 秒，以免信号抖动导致反复锁定。RSSI 读数只在新鲜（4 秒内）时才参与阈值比较，过期读数不会用连接状态代替；连接状态本身也会在 15 秒无更新后失效。适配器被系统停止时扫描器会自动重建。
+- U 盘列表同时枚举可移动盘和由 WMI 识别为 USB 的固定盘（移动硬盘、移动 SSD），优先保存 WMI 暴露的 `PNPDeviceID`，不可用时依次回退到已学习的硬件关联、卷序列号。存在性检查会匹配设备暴露的全部标识，因此某次 WMI 查询失败不会误判设备已拔出；WMI 硬件表缓存 5 秒以避免每秒扫描都访问 WMI。扫描在后台线程执行，避免阻塞设置界面。
 - 锁定覆盖层按显示器创建无激活、置顶、近乎完全透明的原生窗口；覆盖完整显示器矩形（含任务栏），不含标题栏/系统菜单。锁定期间每秒校对一次：新增显示器会被补上，移除的显示器对应窗口会被回收，已有覆盖不会被先销毁再重建，因此刷新过程中输入始终保持拦截。
 - 首次启动会先加载配置并等待设置页完成初始化后再启用策略评估；重复启动会被单实例互斥体拒绝。
 - 设置页采用 BetterLyrics 同款的 `NavigationView` + `SettingsCard` 分区结构，托盘左键/双击打开设置，右键显示带图标菜单。修改任何选项后会自动防抖保存，相同值不会重复落盘。
