@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.3" />
+    <Compile Include="../../Models/SettingsModels.cs" Link="Production/SettingsModels.cs" />
+    <Compile Include="../../Services/SettingsStore.cs" Link="Production/SettingsStore.cs" />
+    <Compile Include="../../Services/BluetoothMonitor.cs" Link="Production/BluetoothMonitor.cs" />
+    <Compile Include="../../Services/UsbMonitor.cs" Link="Production/UsbMonitor.cs" />
+    <Compile Include="../../Services/KeyboardInterceptor.cs" Link="Production/KeyboardInterceptor.cs" />
+    <Compile Include="../../Services/LockCoordinator.cs" Link="Production/LockCoordinator.cs" />
+    <Compile Include="../../Services/AppServices.cs" Link="Production/AppServices.cs" />
+  </ItemGroup>
+</Project>
