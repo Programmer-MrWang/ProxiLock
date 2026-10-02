@@ -25,17 +25,21 @@ public sealed class UsbMonitor
     private DateTimeOffset _hardwareCacheAt = DateTimeOffset.MinValue;
 
     /// <summary>
-    /// Volume serial to physical-disk PNP id, learned on scans where WMI answered. It is
-    /// what lets a device keep its configured identity when a later WMI query fails, or when
-    /// the selection was made while WMI was unavailable.
+    /// The volume serial is deliberately kept with the cached WMI entry. A drive letter is
+    /// not an identity: Windows can assign the same letter to a different USB disk as soon as
+    /// the original one is removed. Cached entries are only trusted when their serial still
+    /// matches the volume currently mounted at that letter.
     /// </summary>
-    private readonly Dictionary<string, string> _pnpByVolumeSerial = new(StringComparer.OrdinalIgnoreCase);
+    private readonly record struct UsbVolumeHardware(string PnpId, string? Model, string? VolumeSerial);
 
-    private readonly record struct UsbVolumeHardware(string PnpId, string? Model);
+    private readonly record struct HardwareSnapshot(
+        IReadOnlyDictionary<string, UsbVolumeHardware> Entries,
+        bool IsFresh);
 
     public IReadOnlyList<UsbDeviceInfo> Scan()
     {
         var hardware = GetUsbVolumeHardware();
+        var retriedHardware = false;
         DriveInfo[] drives;
         try
         {
@@ -49,110 +53,124 @@ public sealed class UsbMonitor
         var result = new List<UsbDeviceInfo>();
         foreach (var drive in drives)
         {
-            string letter;
-            bool ready;
             try
             {
-                ready = drive.IsReady;
-                letter = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+                if (!drive.IsReady) continue;
+
+                var letter = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+                var key = letter.ToUpperInvariant();
+                var serial = TryGetVolumeSerial(letter);
+
+                // A PNP-only volume cannot validate a cached drive-letter association. Read
+                // WMI again before deciding rather than alternately accepting it on refresh
+                // ticks and treating it as absent for the rest of the cache lifetime. One
+                // additional query covers every remaining drive in this scan.
+                if (!hardware.IsFresh && !retriedHardware
+                    && hardware.Entries.TryGetValue(key, out var cachedHardware)
+                    && (serial is null || cachedHardware.VolumeSerial is null))
+                {
+                    retriedHardware = true;
+                    hardware = GetUsbVolumeHardware(forceRefresh: true);
+                }
+
+                // A freshly read WMI map is safe even when the volume serial API is
+                // unavailable; a cached map is only safe with an exact serial match.
+                var usbBacked = hardware.Entries.TryGetValue(key, out var hardwareInfo)
+                    && IsHardwareMatch(serial, hardwareInfo.VolumeSerial, hardware.IsFresh);
+
+                var driveType = drive.DriveType;
+                // Removable media is listed even without a WMI answer; fixed disks only count
+                // when WMI identified their physical bus as USB. That distinction is what makes
+                // USB hard disks and SSDs work, since Windows reports them as fixed drives.
+                if (!usbBacked && driveType != DriveType.Removable) continue;
+
+                // A credential must have an identity that survives drive-letter reuse. If both
+                // WMI and the volume serial API are unavailable, keep the volume visible for
+                // diagnostics but leave its identity empty so it cannot be saved as a lock
+                // credential. Never manufacture DRIVE:E:, which any replacement disk could
+                // satisfy.
+                var instanceId = ResolveInstanceId(serial, usbBacked ? hardwareInfo.PnpId : null) ?? string.Empty;
+                var identifiers = new List<string>();
+                if (!string.IsNullOrWhiteSpace(instanceId))
+                    identifiers.Add(instanceId);
+                if (usbBacked && !string.IsNullOrWhiteSpace(hardwareInfo.PnpId))
+                    identifiers.Add(hardwareInfo.PnpId);
+                if (serial is not null)
+                    identifiers.Add($"VOLUME:{serial}");
+
+                var model = usbBacked ? hardwareInfo.Model : null;
+                var volumeLabel = drive.VolumeLabel;
+                var name = !string.IsNullOrWhiteSpace(volumeLabel) ? volumeLabel
+                    : !string.IsNullOrWhiteSpace(model) ? model
+                    : "USB Drive";
+
+                result.Add(new UsbDeviceInfo
+                {
+                    DriveLetter = letter,
+                    Name = name,
+                    InstanceId = instanceId,
+                    Identifiers = identifiers.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                });
             }
             catch
             {
                 // A drive can disappear between enumeration and inspection.
                 continue;
             }
-            if (!ready) continue;
-
-            var key = letter.ToUpperInvariant();
-            var usbBacked = hardware.TryGetValue(key, out var hardwareInfo);
-            // Removable media is listed even without a WMI answer; fixed disks only count
-            // when WMI identified their physical bus as USB. That distinction is what makes
-            // USB hard disks and SSDs work, since Windows reports them as fixed drives.
-            if (!usbBacked && drive.DriveType != DriveType.Removable) continue;
-
-            var serial = TryGetVolumeSerial(letter);
-            if (usbBacked && serial is not null && !string.IsNullOrWhiteSpace(hardwareInfo.PnpId))
-            {
-                lock (_gate) _pnpByVolumeSerial[serial] = hardwareInfo.PnpId;
-            }
-
-            var instanceId = ResolveInstanceId(key, serial, usbBacked ? hardwareInfo.PnpId : null);
-            var identifiers = new List<string> { instanceId };
-            if (usbBacked && !string.IsNullOrWhiteSpace(hardwareInfo.PnpId))
-                identifiers.Add(hardwareInfo.PnpId);
-            if (serial is not null)
-                identifiers.Add($"VOLUME:{serial}");
-            identifiers.Add($"DRIVE:{key}");
-
-            var model = usbBacked ? hardwareInfo.Model : null;
-            var name = !string.IsNullOrWhiteSpace(drive.VolumeLabel) ? drive.VolumeLabel
-                : !string.IsNullOrWhiteSpace(model) ? model
-                : "USB Drive";
-
-            result.Add(new UsbDeviceInfo
-            {
-                DriveLetter = letter,
-                Name = name,
-                InstanceId = instanceId,
-                Identifiers = identifiers.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-            });
         }
 
         return result;
     }
 
     /// <summary>
-    /// Picks the identifier to persist. WMI's PNP id is preferred because it follows the
-    /// physical device across drive letters; the volume serial is next, and a learned
-    /// serial-to-PNP association recovers the hardware id when WMI is momentarily unavailable.
+    /// A cached drive-letter association is valid only with matching volume serials.
+    /// When either serial is unavailable, a fresh WMI association is required.
     /// </summary>
-    private string ResolveInstanceId(string driveLetterKey, string? volumeSerial, string? pnpId)
+    internal static bool IsHardwareMatch(string? currentSerial, string? recordedSerial, bool fresh)
+        => currentSerial is not null && recordedSerial is not null
+            ? string.Equals(currentSerial, recordedSerial, StringComparison.OrdinalIgnoreCase)
+            : fresh;
+
+    // Prefer physical identity; a volume serial is the fallback. Never use a drive letter.
+    private static string? ResolveInstanceId(string? volumeSerial, string? pnpId)
     {
         if (!string.IsNullOrWhiteSpace(pnpId)) return pnpId;
-
-        if (volumeSerial is not null)
-        {
-            lock (_gate)
-            {
-                if (_pnpByVolumeSerial.TryGetValue(volumeSerial, out var learned) && !string.IsNullOrWhiteSpace(learned))
-                    return learned;
-            }
-            return $"VOLUME:{volumeSerial}";
-        }
-
-        // Last-resort compatibility for unusual virtual/removable volumes.
-        return $"DRIVE:{driveLetterKey}";
+        return volumeSerial is not null ? $"VOLUME:{volumeSerial}" : null;
     }
 
     /// <summary>
     /// True when a device carrying the saved identifier is currently attached. Matching
-    /// considers every identifier the device exposes, so a value saved under one scheme
-    /// still matches when the scan can only produce another.
+    /// considers each verified identifier exposed by the current scan.
     /// </summary>
     public bool IsPresent(string? instanceId)
         => !string.IsNullOrWhiteSpace(instanceId)
            && Scan().Any(d => d.Identifiers.Contains(instanceId, StringComparer.OrdinalIgnoreCase));
 
-    private Dictionary<string, UsbVolumeHardware> GetUsbVolumeHardware()
+    private HardwareSnapshot GetUsbVolumeHardware(bool forceRefresh = false)
     {
         lock (_gate)
         {
-            if (DateTimeOffset.UtcNow - _hardwareCacheAt < HardwareCacheTtl)
-                return _hardwareCache;
+            if (!forceRefresh && DateTimeOffset.UtcNow - _hardwareCacheAt < HardwareCacheTtl)
+                return new HardwareSnapshot(_hardwareCache, IsFresh: false);
         }
 
-        var fresh = ReadUsbVolumeHardware();
+        var read = ReadUsbVolumeHardware();
         lock (_gate)
         {
-            // A failed query must not erase a good map; keep the previous one so a transient
-            // WMI outage does not make every USB device look unplugged.
-            if (fresh.Count > 0) _hardwareCache = fresh;
+            // A failed query may keep the old map for continuity, but Scan validates each
+            // cached entry against its volume serial before trusting it. A successful empty
+            // query must clear the old map so an unplugged disk is never retained.
+            if (read.Succeeded) _hardwareCache = read.Entries;
             _hardwareCacheAt = DateTimeOffset.UtcNow;
-            return _hardwareCache;
+            return new HardwareSnapshot(_hardwareCache, read.Succeeded);
         }
     }
 
-    private static Dictionary<string, UsbVolumeHardware> ReadUsbVolumeHardware()
+    private readonly record struct HardwareReadResult(
+        Dictionary<string, UsbVolumeHardware> Entries,
+        bool Succeeded);
+
+    private static HardwareReadResult ReadUsbVolumeHardware()
     {
         var result = new Dictionary<string, UsbVolumeHardware>(StringComparer.OrdinalIgnoreCase);
         try
@@ -181,7 +199,11 @@ public sealed class UsbMonitor
                                 {
                                     var letter = logicalDisk["DeviceID"]?.ToString();
                                     if (!string.IsNullOrWhiteSpace(letter))
-                                        result[letter.ToUpperInvariant()] = new UsbVolumeHardware(pnpId, model);
+                                    {
+                                        var volumeSerial = logicalDisk["VolumeSerialNumber"]?.ToString();
+                                        if (string.IsNullOrWhiteSpace(volumeSerial)) volumeSerial = null;
+                                        result[letter.ToUpperInvariant()] = new UsbVolumeHardware(pnpId, model, volumeSerial);
+                                    }
                                 }
                             }
                         }
@@ -191,9 +213,12 @@ public sealed class UsbMonitor
         }
         catch
         {
-            // WMI is optional; the volume serial fallback keeps scanning alive.
+            // WMI is optional. The caller may use a previously cached entry only when its
+            // volume serial still matches; a different disk in the same drive letter is then
+            // rejected instead of being mistaken for the configured credential.
+            return new HardwareReadResult(result, Succeeded: false);
         }
-        return result;
+        return new HardwareReadResult(result, Succeeded: true);
     }
 
     /// <summary>
