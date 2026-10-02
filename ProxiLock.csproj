@@ -2,6 +2,10 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <Version>1.0.1</Version>
+    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <FileVersion>1.0.1.0</FileVersion>
+    <InformationalVersion>1.0.1</InformationalVersion>
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
     <RootNamespace>ProxiLock</RootNamespace>
@@ -17,10 +21,15 @@
     <EnableMsixTooling>true</EnableMsixTooling>
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!-- WinUI 3/Windows App SDK needs native DLLs, PRI files and bootstrap
+         resources beside the app. Single-file bundling breaks WinRT activation. -->
+    <PublishSingleFile>false</PublishSingleFile>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
     <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
     <!-- Use the user-provided root icon for the executable and all shell surfaces. -->
     <ApplicationIcon>icon.ico</ApplicationIcon>
@@ -28,7 +37,7 @@
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <!-- Make the intended entry point explicit for IDE/design-time builds as well. -->
     <StartupObject>ProxiLock.Program</StartupObject>
-    <DefaultItemExcludes>$(DefaultItemExcludes);bin\**;obj\**;buildobj\**;buildbin\**;.idea\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin\**;obj\**;buildobj\**;buildbin\**;.idea\**;tests\**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />

@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore locked dependencies
+        run: dotnet restore ProxiLock.csproj --locked-mode
+
+      - name: Build Release
+        run: dotnet build ProxiLock.csproj -c Release --no-restore
+
+      - name: Restore regression dependencies
+        run: dotnet restore tests/ProxiLock.Regression/ProxiLock.Regression.csproj --locked-mode
+
+      - name: Run isolated regressions
+        run: dotnet run --project tests/ProxiLock.Regression -c Release --no-restore
