@@ -29,6 +29,11 @@ public sealed class LockCoordinator : IDisposable
     private readonly UsbMonitor _usb = new();
     private readonly DispatcherQueue _dispatcher;
     private readonly object _settingsGate = new();
+    // Resource repair happens on the monitor thread. Serialize it with UI-thread
+    // lock transitions so a failed repair can only tear down its own lock session.
+    private readonly object _lockGate = new();
+    private long _lockSession;
+    private long _pendingLockFailureSession;
     private CancellationTokenSource? _cts;
     private AppSettings _settings;
     private volatile LockReason _reason;
@@ -41,7 +46,7 @@ public sealed class LockCoordinator : IDisposable
     private volatile bool _armed;
     private volatile bool _disposed;
 
-    public bool IsLocked => _overlays.IsVisible;
+    public bool IsLocked => _reason != LockReason.None && _overlays.IsVisible;
     public BluetoothMonitor Bluetooth => _bluetooth;
     public UsbMonitor Usb => _usb;
 
@@ -67,12 +72,13 @@ public sealed class LockCoordinator : IDisposable
 
     public event EventHandler<bool>? LockStateChanged;
 
-    public LockCoordinator(SettingsStore store, NotificationService notifications, DispatcherQueue dispatcher)
+    public LockCoordinator(SettingsStore store, NotificationService notifications, DispatcherQueue dispatcher,
+                           AppSettings? initialSettings = null)
     {
         _store = store;
         _notifications = notifications;
         _dispatcher = dispatcher;
-        _settings = Normalize(store.Load());
+        _settings = Normalize(initialSettings ?? store.Load());
         ResetIdleBaseline();
     }
 
@@ -104,12 +110,12 @@ public sealed class LockCoordinator : IDisposable
         {
             await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
             if (!_disposed && !_armed)
-                Arm();
+                _dispatcher.TryEnqueue(() => { if (!_disposed && !_armed) Arm(); });
         }
         catch (OperationCanceledException) { }
     }
 
-    public void ApplySettings(AppSettings settings, bool persist = true)
+    public void ApplySettings(AppSettings settings, bool persist = true, bool forcePersist = false)
     {
         var normalized = Normalize(settings);
 
@@ -124,14 +130,14 @@ public sealed class LockCoordinator : IDisposable
         // Persist before publishing the new settings. If the write fails the exception
         // reaches the caller, the running configuration still matches what is on disk, and
         // the next attempt is still seen as a change instead of being skipped as a no-op.
-        if (changed && persist)
+        if ((changed || forcePersist) && persist)
             _store.Save(normalized);
 
         LockMode previousMode;
         lock (_settingsGate)
         {
             previousMode = _settings.LockMode;
-            _settings = normalized;
+            if (changed) _settings = normalized;
         }
 
         if (changed)
@@ -160,14 +166,37 @@ public sealed class LockCoordinator : IDisposable
 
     public void Lock(LockReason reason)
     {
-        if (_disposed) return;
+        if (_disposed || !IsReasonConfigured(reason)) return;
         if (!_dispatcher.HasThreadAccess)
         {
-            _dispatcher.TryEnqueue(() => Lock(reason));
+            AppSettings snapshot;
+            lock (_settingsGate) snapshot = _settings;
+            // Each monitor tick retries a rejected enqueue using fresh observations.
+            _dispatcher.TryEnqueue(() =>
+            {
+                if (IsCurrentSettings(snapshot)) LockOnUi(reason);
+            });
             return;
         }
+        LockOnUi(reason);
+    }
+
+    private bool IsCurrentSettings(AppSettings snapshot)
+    {
+        lock (_settingsGate) return !_disposed && ReferenceEquals(snapshot, _settings);
+    }
+
+    private void LockOnUi(LockReason reason)
+    {
+        lock (_lockGate) LockOnUiCore(reason);
+    }
+
+    private void LockOnUiCore(LockReason reason)
+    {
+        if (_disposed || !IsReasonConfigured(reason)) return;
         if (IsLocked || _manualUnlockOverride == reason) return;
 
+        ++_lockSession;
         _reason = reason;
         try
         {
@@ -179,19 +208,46 @@ public sealed class LockCoordinator : IDisposable
             {
                 _overlays.Hide();
                 _reason = LockReason.None;
+                ReportLockFailure();
                 return;
             }
         }
         catch
         {
-            _keyboard.Stop();
-            _overlays.Hide();
+            try { _keyboard.Stop(); } catch { }
+            try { _overlays.Hide(); } catch { }
             _reason = LockReason.None;
+            ReportLockFailure();
             return;
         }
 
         _notifications.Show("ProxiLock", "已锁定");
         LockStateChanged?.Invoke(this, true);
+    }
+
+    private DateTimeOffset _lastLockWarning;
+
+    private void ReportLockFailure()
+    {
+        if (DateTimeOffset.UtcNow - _lastLockWarning < TimeSpan.FromMinutes(1)) return;
+        _lastLockWarning = DateTimeOffset.UtcNow;
+        _notifications.Show("ProxiLock", "无法维持输入拦截，当前未锁定。请重新启动程序后重试。");
+    }
+
+    private bool IsReasonConfigured(LockReason reason)
+    {
+        lock (_settingsGate)
+        {
+            return reason switch
+            {
+                LockReason.Bluetooth => _settings.LockMode == LockMode.Bluetooth
+                    && !string.IsNullOrWhiteSpace(_settings.Bluetooth.DeviceAddress),
+                LockReason.Usb => _settings.LockMode == LockMode.Usb
+                    && !string.IsNullOrWhiteSpace(_settings.Usb.DeviceInstanceId),
+                LockReason.Idle => _settings.LockMode == LockMode.Idle,
+                _ => false
+            };
+        }
     }
 
     public void Unlock() => UnlockCore(preserveManualOverride: false);
@@ -227,7 +283,14 @@ public sealed class LockCoordinator : IDisposable
             _dispatcher.TryEnqueue(() => UnlockCore(preserveManualOverride));
             return;
         }
-        if (!IsLocked)
+
+        lock (_lockGate) UnlockOnUi(preserveManualOverride);
+    }
+
+    private void UnlockOnUi(bool preserveManualOverride)
+    {
+        ++_lockSession;
+        if (_reason == LockReason.None && !_overlays.IsVisible)
         {
             ResetIdleBaseline();
             return;
@@ -251,7 +314,7 @@ public sealed class LockCoordinator : IDisposable
             {
                 try
                 {
-                    if (_armed && (DateTimeOffset.UtcNow - _startedAt).TotalSeconds >= 2)
+                    if (_armed)
                         Evaluate();
                 }
                 catch
@@ -268,14 +331,30 @@ public sealed class LockCoordinator : IDisposable
 
     private void Evaluate()
     {
-        if (IsLocked)
+        lock (_lockGate)
         {
-            // The overlay manager owns its own Win32 message-loop thread. Ask it to
-            // reconcile every tick so another topmost window cannot expose a gap and
-            // monitor hot-plug is picked up. Existing coverage is repaired in place,
-            // so input stays captured across a display change.
-            _overlays.ReassertTopmost();
+            if (_disposed) return;
+            // _reason also detects an overlay thread that already exited and removed
+            // its windows: the keyboard hook must still be released in that case.
+            if (_reason != LockReason.None)
+            {
+                try
+                {
+                    _overlays.ReassertTopmost();
+                }
+                catch
+                {
+                    // Cleanup does not depend on the UI queue being available. Holding
+                    // this gate prevents a new lock from starting between the failed
+                    // repair and teardown of the old keyboard/overlay resources.
+                    try { _keyboard.Stop(); } catch { }
+                    try { _overlays.Hide(); } catch { }
+                    _reason = LockReason.None;
+                    Volatile.Write(ref _pendingLockFailureSession, ++_lockSession);
+                }
+            }
         }
+        ReportPendingLockFailure();
 
         AppSettings settings;
         lock (_settingsGate) settings = _settings;
@@ -287,6 +366,38 @@ public sealed class LockCoordinator : IDisposable
         var bluetoothStatus = string.IsNullOrWhiteSpace(settings.Bluetooth.DeviceAddress)
             ? new BluetoothStatus(BluetoothPresence.Unknown, BluetoothReason.ScanIncomplete)
             : _bluetooth.Evaluate(settings.Bluetooth.DeviceAddress, settings.Bluetooth.Threshold);
+        // Device I/O stays off the UI thread. Decisions are serialized with settings edits,
+        // hotkey unlocks and idle baselines; a result for an old device can never lock the new one.
+        bool? usbPresent = settings.LockMode == LockMode.Usb
+            && !string.IsNullOrWhiteSpace(settings.Usb.DeviceInstanceId)
+            ? _usb.IsPresent(settings.Usb.DeviceInstanceId) : null;
+        _dispatcher.TryEnqueue(() => ApplyObservation(settings, bluetoothStatus, usbPresent));
+    }
+
+    private void ReportPendingLockFailure()
+    {
+        var failedSession = Volatile.Read(ref _pendingLockFailureSession);
+        if (failedSession == 0) return;
+        // A rejected enqueue keeps the notice pending for the next monitor tick.
+        _dispatcher.TryEnqueue(() =>
+        {
+            lock (_lockGate)
+            {
+                if (Interlocked.CompareExchange(ref _pendingLockFailureSession, 0, failedSession) != failedSession)
+                    return;
+                // A newer Show/Hide owns the current UI status. An old failure notice
+                // must not mark that newer lock as unlocked or reset its idle baseline.
+                if (_disposed || _lockSession != failedSession) return;
+                ResetIdleBaseline();
+                LockStateChanged?.Invoke(this, false);
+                ReportLockFailure();
+            }
+        });
+    }
+
+    private void ApplyObservation(AppSettings settings, BluetoothStatus bluetoothStatus, bool? usbPresent)
+    {
+        if (!IsCurrentSettings(settings) || (DateTimeOffset.UtcNow - _startedAt).TotalSeconds < 2) return;
         lock (_settingsGate) _bluetoothStatus = bluetoothStatus;
 
         switch (settings.LockMode)
@@ -296,8 +407,8 @@ public sealed class LockCoordinator : IDisposable
                 break;
             case LockMode.Usb:
                 if (string.IsNullOrWhiteSpace(settings.Usb.DeviceInstanceId)) break;
-                var usbPresent = _usb.IsPresent(settings.Usb.DeviceInstanceId);
-                if (!usbPresent) Lock(LockReason.Usb);
+                if (usbPresent is null) break;
+                if (!usbPresent.Value) Lock(LockReason.Usb);
                 else
                 {
                     if (_manualUnlockOverride == LockReason.Usb)
@@ -400,21 +511,32 @@ public sealed class LockCoordinator : IDisposable
 
     private static AppSettings Normalize(AppSettings? source)
     {
-        var settings = source ?? new AppSettings();
-        settings.Bluetooth ??= new BluetoothSettings();
-        settings.Usb ??= new UsbSettings();
-        settings.Idle ??= new IdleSettings();
-        settings.Idle.Minutes = Math.Clamp(settings.Idle.Minutes, 1, 1440);
-        if (settings.Bluetooth.Threshold is int threshold)
-            settings.Bluetooth.Threshold = Math.Clamp(threshold, -100, -20);
-        if (!Enum.IsDefined(settings.LockMode)) settings.LockMode = LockMode.None;
+        var settings = new AppSettings
+        {
+            LockMode = source?.LockMode ?? LockMode.None,
+            AutoStart = source?.AutoStart ?? false,
+            Bluetooth = new BluetoothSettings
+            {
+                DeviceAddress = source?.Bluetooth?.DeviceAddress,
+                Threshold = source?.Bluetooth?.Threshold is int threshold ? Math.Clamp(threshold, -100, -20) : null
+            },
+            Usb = new UsbSettings { DeviceInstanceId = source?.Usb?.DeviceInstanceId },
+            Idle = new IdleSettings { Minutes = Math.Clamp(source?.Idle?.Minutes ?? 5, 1, 1440) }
+        };
+        if (!Enum.IsDefined(settings.LockMode)) throw new ArgumentException("Invalid lock mode.");
         return settings;
     }
 
     public void Dispose()
     {
+        lock (_lockGate) DisposeCore();
+    }
+
+    private void DisposeCore()
+    {
         if (_disposed) return;
         _disposed = true;
+        ++_lockSession;
         _cts?.Cancel();
         _cts = null;
         // Both native resources have deterministic, thread-safe teardown. Do this

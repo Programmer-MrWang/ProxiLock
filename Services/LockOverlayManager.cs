@@ -121,7 +121,19 @@ public sealed class LockOverlayManager : IDisposable
     /// windows for monitors that disappeared. Existing coverage is never torn down
     /// first, so input is not briefly unblocked while the layer is refreshed.
     /// </summary>
-    public void ReassertTopmost() => PostCommand(CommandReassert);
+    public void ReassertTopmost()
+    {
+        lock (_commandGate)
+        {
+            ThrowIfDisposed();
+            if (_thread is not { IsAlive: true })
+                throw new InvalidOperationException("Lock overlay thread is no longer running.");
+
+            // The monitor calls this off the UI thread. Wait for the actual repair
+            // result so failed coverage cannot be silently reported as a valid lock.
+            SendCommandAndWait(CommandReassert, TimeSpan.FromSeconds(3));
+        }
+    }
 
     public void Hide()
     {
@@ -207,10 +219,13 @@ public sealed class LockOverlayManager : IDisposable
                         {
                             case CommandShow: SyncWindowsCore(); break;
                             case CommandHide: DestroyWindowsCore(); break;
-                            // A reassert can be posted just before an unlock; without this
-                            // guard it would run after teardown and recreate the capture
-                            // layer over an unlocked screen.
-                            case CommandReassert: if (IsVisible) SyncWindowsCore(); break;
+                            // Reassert must not recreate a layer after Hide, and an
+                            // unexpectedly empty layer is a repair failure to the caller.
+                            case CommandReassert:
+                                if (!IsVisible)
+                                    throw new InvalidOperationException("Lock overlay coverage was lost.");
+                                SyncWindowsCore();
+                                break;
                         }
                         if (pending is not null && Interlocked.Read(ref _pendingToken) == token)
                             pending.TrySetResult(null);
@@ -268,14 +283,6 @@ public sealed class LockOverlayManager : IDisposable
     private void TrySendCommandAndWait(uint command, TimeSpan timeout)
     {
         try { SendCommandAndWait(command, timeout); } catch { }
-    }
-
-    private void PostCommand(uint command)
-    {
-        if (_disposed) return;
-        uint threadId;
-        lock (_stateGate) threadId = _threadId;
-        if (threadId != 0) PostThreadMessage(threadId, command, IntPtr.Zero, IntPtr.Zero);
     }
 
     private void SyncWindowsCore()
@@ -336,15 +343,35 @@ public sealed class LockOverlayManager : IDisposable
         if (hwnd == IntPtr.Zero)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to create lock overlay window.");
 
-        // Explicitly strip every caption/system-menu/resizing style. WS_POPUP
-        // already has no title bar, but this also repairs any shell-injected style.
-        var style = GetWindowLongPtr(hwnd, GwlStyle).ToInt64();
-        style &= ~(WsCaption | WsThickFrame | WsSysMenu | WsMinimizeBox | WsMaximizeBox);
-        style |= WsPopup;
-        SetWindowLongPtr(hwnd, GwlStyle, new IntPtr(style));
-        SetLayeredWindowAttributes(hwnd, 0, 1, LwaAlpha);
-        SetWindowPos(hwnd, HwndTopmost, monitor.Left, monitor.Top, width, height, SwpNoActivate | SwpShowWindow | SwpNoOwnerZOrder | SwpFrameChanged);
-        ShowWindow(hwnd, SwShownoactivate);
+        try
+        {
+            // Explicitly strip every caption/system-menu/resizing style. WS_POPUP
+            // already has no title bar, but this also repairs any shell-injected style.
+            var style = GetWindowLongPtr(hwnd, GwlStyle).ToInt64();
+            if (style == 0)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to read lock overlay window style.");
+
+            style &= ~(WsCaption | WsThickFrame | WsSysMenu | WsMinimizeBox | WsMaximizeBox);
+            style |= WsPopup;
+            var previousStyle = SetWindowLongPtr(hwnd, GwlStyle, new IntPtr(style));
+            if (previousStyle == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to configure lock overlay window style.");
+
+            if (!SetLayeredWindowAttributes(hwnd, 0, 1, LwaAlpha))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to configure lock overlay transparency.");
+            if (!SetWindowPos(hwnd, HwndTopmost, monitor.Left, monitor.Top, width, height,
+                    SwpNoActivate | SwpShowWindow | SwpNoOwnerZOrder | SwpFrameChanged))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to position lock overlay window.");
+
+            // ShowWindow returns the previous visibility state, so false is not an
+            // error here. SetWindowPos above is the operation whose result matters.
+            ShowWindow(hwnd, SwShownoactivate);
+        }
+        catch
+        {
+            try { if (IsWindow(hwnd)) DestroyWindow(hwnd); } catch { }
+            throw;
+        }
 
         lock (_stateGate)
         {
@@ -381,7 +408,9 @@ public sealed class LockOverlayManager : IDisposable
     private static void MoveWindowToRect(IntPtr hwnd, RECT rect)
     {
         if (!IsWindow(hwnd)) return;
-        SetWindowPos(hwnd, HwndTopmost, rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top, SwpNoActivate | SwpNoOwnerZOrder | SwpFrameChanged);
+        if (!SetWindowPos(hwnd, HwndTopmost, rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top,
+                SwpNoActivate | SwpNoOwnerZOrder | SwpFrameChanged))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to reassert lock overlay position.");
     }
 
     private static RECT GetMonitorRectFromHandle(IntPtr monitor)

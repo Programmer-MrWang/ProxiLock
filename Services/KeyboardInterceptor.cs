@@ -16,6 +16,9 @@ public sealed class KeyboardInterceptor : IDisposable
     private const int WmSyskeyup = 0x0105;
     private const uint WmQuit = 0x0012;
     private const uint PmNoremove = 0x0000;
+    // KBDLLHOOKSTRUCT.flags. Injected input must never be allowed to satisfy the
+    // unlock shortcut (or alter the physical modifier state tracked below).
+    private const int LlkhfInjected = 0x00000010;
 
     private const int VkL = 0x4C;
     private const int VkControl = 0x11;
@@ -168,6 +171,14 @@ public sealed class KeyboardInterceptor : IDisposable
         {
             var message = unchecked((int)wParam.ToInt64());
             var vkCode = Marshal.ReadInt32(lParam);
+            var flags = Marshal.ReadInt32(IntPtr.Add(lParam, sizeof(int) * 2));
+
+            // SendInput and lower-level hooks can synthesize Ctrl+Shift+L. Keep
+            // swallowing the event while locked, but do not let it participate in
+            // our physical-key state machine or trigger an unlock.
+            if ((flags & LlkhfInjected) != 0)
+                return new IntPtr(1);
+
             var isDown = message is WmKeydown or WmSyskeydown;
             var isUp = message is WmKeyup or WmSyskeyup;
 
