@@ -59,8 +59,8 @@ public sealed class BluetoothDeviceInfo : INotifyPropertyChanged
     private bool _isRandomAddress;
 
     /// <summary>
-    /// True for a rotating privacy address. Such a device cannot be tracked reliably, so
-    /// the picker flags it rather than letting the user choose it and get a flapping lock.
+    /// True for a random address, which may rotate. The picker conservatively rejects
+    /// unpaired random identities; paired devices retain Windows identity information.
     /// </summary>
     public bool IsRandomAddress
     {
@@ -74,7 +74,7 @@ public sealed class BluetoothDeviceInfo : INotifyPropertyChanged
         }
     }
 
-    /// <summary>True when this device is a reliable credential.</summary>
+    /// <summary>Whether this identity is eligible for selection under the tracking policy.</summary>
     public bool IsStable => IsPaired || !IsRandomAddress;
 
     public short Rssi
@@ -99,6 +99,8 @@ public sealed class BluetoothDeviceInfo : INotifyPropertyChanged
             _isPaired = value;
             Raise(nameof(IsPaired));
             Raise(nameof(StatusText));
+            Raise(nameof(IsStable));
+            Raise(nameof(SignalText));
         }
     }
 
@@ -147,15 +149,16 @@ public sealed class UsbDeviceInfo
 
     /// <summary>
     /// The identifier to persist for this device, preferring the physical (PNP) id so the
-    /// choice survives a drive-letter change.
+    /// choice survives a drive-letter change. It is empty when Windows exposes neither a PNP
+    /// id nor a volume serial; such a row remains visible for diagnostics but cannot be used
+    /// as a lock credential.
     /// </summary>
     public string InstanceId { get; init; } = string.Empty;
 
     /// <summary>
-    /// Every identifier this device can be recognised by: the preferred id, the PNP id, the
-    /// volume serial and the drive letter. Presence checks match against all of them, so a
-    /// saved value still matches when a scan can only produce a different identifier, for
-    /// example a transient WMI failure that leaves only the volume serial available.
+    /// Verified identifiers exposed by this scan: the preferred id, PNP id and volume serial.
+    /// Drive letters are never identities. If a saved PNP id cannot be verified, a volume
+    /// serial alone does not establish that it is the same physical device.
     /// </summary>
     public IReadOnlyList<string> Identifiers { get; init; } = Array.Empty<string>();
 

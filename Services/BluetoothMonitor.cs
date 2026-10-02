@@ -147,16 +147,24 @@ public sealed class BluetoothMonitor : IDisposable
         public BluetoothLEDevice? LowEnergy;
     }
 
+    private readonly record struct PairedQueryResult(
+        List<(ulong Address, string? Name)> Devices,
+        bool Succeeded);
+
     private readonly object _gate = new();
     private readonly Dictionary<ulong, State> _states = new();
     private readonly List<ulong> _order = new();
     private readonly Dictionary<ulong, string?> _resolvedNames = new();
     private readonly HashSet<ulong> _nameLookupsInFlight = new();
     private readonly Dictionary<ulong, PairedHandle> _handles = new();
+    // Name resolution is best-effort UI enrichment. Bound the number of radio
+    // requests so a burst of advertisements cannot create an unbounded task storm.
+    private readonly SemaphoreSlim _nameLookupSlots = new(4, 4);
 
     private BluetoothLEAdvertisementWatcher? _watcher;
     private Timer? _pairedTimer;
     private Timer? _connectionTimer;
+    private Timer? _watcherTimer;
     /// <summary>
     /// Cancels in-flight radio work. Written under <see cref="_gate"/> and read by timer
     /// callbacks off-thread, so it is volatile; it is deliberately never disposed (see
@@ -165,10 +173,10 @@ public sealed class BluetoothMonitor : IDisposable
     private volatile CancellationTokenSource? _lifetime;
     private int _pairedRefreshRunning;
     private int _connectionPollRunning;
-    private int _watcherRestartRunning;
     private volatile bool _hasScanned;
     private volatile bool _active;
     private bool _disposed;
+    private long _sessionId;
 
     /// <summary>When any advertisement was last received, from any device.</summary>
     private DateTimeOffset? _lastAnyAdvertisementAt;
@@ -189,19 +197,27 @@ public sealed class BluetoothMonitor : IDisposable
 
     public void Start()
     {
-        if (_disposed) return;
-        _active = true;
         lock (_gate)
         {
-            _lifetime ??= new CancellationTokenSource();
+            if (_disposed) return;
+            if (!_active)
+            {
+                _active = true;
+                Interlocked.Increment(ref _sessionId);
+                _lifetime = new CancellationTokenSource();
+            }
             EnsureWatcher();
+            _pairedTimer ??= new Timer(_ => RefreshPairedDevicesAsync(), null, TimeSpan.Zero, PairedRefreshInterval);
+            _connectionTimer ??= new Timer(_ => PollConnectionStatusAsync(), null, TimeSpan.Zero, ConnectionPollInterval);
+            // Retry even if the first start or a restart fails while the adapter is off.
+            _watcherTimer ??= new Timer(_ =>
+            {
+                lock (_gate)
+                {
+                    if (_active && !_disposed) EnsureWatcher();
+                }
+            }, null, ConnectionPollInterval, ConnectionPollInterval);
         }
-
-        // Paired devices are filtered out of the picker until they are actually connected.
-        // Connection state is read from ConnectionStatus on a periodic poll, because the
-        // AEP IsConnected property is not populated on every machine.
-        _pairedTimer ??= new Timer(_ => RefreshPairedDevicesAsync(), null, TimeSpan.Zero, PairedRefreshInterval);
-        _connectionTimer ??= new Timer(_ => PollConnectionStatusAsync(), null, TimeSpan.Zero, ConnectionPollInterval);
     }
 
     /// <summary>
@@ -222,12 +238,20 @@ public sealed class BluetoothMonitor : IDisposable
             var watcher = new BluetoothLEAdvertisementWatcher { ScanningMode = BluetoothLEScanningMode.Active };
             watcher.Received += OnReceived;
             watcher.Stopped += OnWatcherStopped;
-            watcher.Start();
+            // Publish the watcher before Start so a synchronous/early Received callback is
+            // still recognised as belonging to the current session.
             _watcher = watcher;
+            watcher.Start();
         }
         catch
         {
             // A missing or disabled radio simply yields no advertisements.
+            if (_watcher is not null)
+            {
+                _watcher.Received -= OnReceived;
+                _watcher.Stopped -= OnWatcherStopped;
+                try { _watcher.Stop(); } catch { }
+            }
             _watcher = null;
         }
     }
@@ -249,59 +273,77 @@ public sealed class BluetoothMonitor : IDisposable
     /// </summary>
     private void OnWatcherStopped(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementWatcherStoppedEventArgs args)
     {
-        CancellationTokenSource? lifetime;
         lock (_gate)
         {
-            if (ReferenceEquals(_watcher, sender)) _watcher = null;
-            lifetime = _lifetime;
+            if (!ReferenceEquals(_watcher, sender)) return;
+            sender.Received -= OnReceived;
+            sender.Stopped -= OnWatcherStopped;
+            _watcher = null;
+            // The lifecycle timer retries every three seconds, including repeated failures.
         }
-
-        if (!_active || _disposed || lifetime is null) return;
-        if (Interlocked.Exchange(ref _watcherRestartRunning, 1) != 0) return;
-
-        var token = lifetime.Token;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                // Give the radio a moment to settle before rebuilding the watcher.
-                await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
-                // Stop may have run during the delay; rebuilding then would resurrect a
-                // watcher the caller had already released.
-                if (!_active || _disposed || token.IsCancellationRequested) return;
-                lock (_gate) EnsureWatcher();
-            }
-            catch (OperationCanceledException) { }
-            catch { }
-            finally
-            {
-                Interlocked.Exchange(ref _watcherRestartRunning, 0);
-            }
-        }, token);
     }
+
+    private bool IsCurrentSession(CancellationToken token, long session)
+        => _active && !_disposed && !token.IsCancellationRequested
+           && Volatile.Read(ref _sessionId) == session;
 
     public void Stop()
     {
-        _active = false;
+        List<PairedHandle> handles;
+        Timer? paired;
+        Timer? connection;
+        Timer? watcherTimer;
+        CancellationTokenSource? lifetime;
         lock (_gate)
         {
+            _active = false;
             DetachWatcher();
 
             // The token source is cancelled but intentionally not disposed: callbacks and
             // polling work that already captured it may still read Token, and reading it
             // after disposal throws. Nothing here uses CancelAfter, so there is no timer to
             // free. A fresh source is created the next time Start runs.
-            var lifetime = _lifetime;
+            lifetime = _lifetime;
             _lifetime = null;
-            try { lifetime?.Cancel(); } catch { }
+
+            // Evidence belongs to a single running scan session. Retaining it across
+            // Stop/Start made a device that had already left look present after the
+            // radio was re-enabled, and retained paired handles could report stale
+            // connection state into the new session.
+            Interlocked.Increment(ref _sessionId);
+            _lastAnyAdvertisementAt = null;
+            _hasScanned = false;
+            _pinnedAddress = null;
+            _states.Clear();
+            _order.Clear();
+            _resolvedNames.Clear();
+            _nameLookupsInFlight.Clear();
+            handles = _handles.Values.ToList();
+            _handles.Clear();
+
+            // Detach the timer fields while still holding the lifecycle gate. Start()
+            // may run immediately after this lock is released; it must never have a
+            // freshly-created timer disposed by an older Stop() call.
+            paired = _pairedTimer;
+            _pairedTimer = null;
+            connection = _connectionTimer;
+            _connectionTimer = null;
+            watcherTimer = _watcherTimer;
+            _watcherTimer = null;
         }
 
-        var paired = _pairedTimer;
-        _pairedTimer = null;
+        // Cancellation may execute callbacks. Never invoke them while holding the state gate.
+        try { lifetime?.Cancel(); } catch { }
+
+        foreach (var handle in handles)
+        {
+            try { handle.Classic?.Dispose(); } catch { }
+            try { handle.LowEnergy?.Dispose(); } catch { }
+        }
+
         paired?.Dispose();
-        var connection = _connectionTimer;
-        _connectionTimer = null;
         connection?.Dispose();
+        watcherTimer?.Dispose();
     }
 
     /// <summary>
@@ -327,10 +369,17 @@ public sealed class BluetoothMonitor : IDisposable
                 var advertised = state.AdvertisedAt is { } seen && now - seen <= AbsentWindow;
                 if (!advertised && !state.IsPaired) continue;
 
+                // A stale RSSI must not be presented as the current distance. The
+                // observation still remains selectable through its advertisement or
+                // pairing evidence, but callers receive the explicit unknown value.
+                var rssi = state.RssiAt is { } measured && now - measured <= PresentWindow
+                    ? state.Rssi
+                    : RssiUnknown;
+
                 result.Add(new BluetoothObservation(
                     FormatAddress(address),
                     state.Name,
-                    state.Rssi,
+                    rssi,
                     state.IsPaired,
                     state.IsPaired && ConnectionFresh(state, now),
                     state.RandomAddress));
@@ -387,16 +436,16 @@ public sealed class BluetoothMonitor : IDisposable
 
             var advertised = state.AdvertisedAt is { } seen && now - seen <= PresentWindow;
             var connected = state.IsPaired && ConnectionFresh(state, now);
-            var measurementMinutes = state.RssiAt is { } measured && now - measured <= PresentWindow && state.Rssi != RssiUnknown;
+            var hasRecentMeasurement = state.RssiAt is { } measured && now - measured <= PresentWindow && state.Rssi != RssiUnknown;
             var silenceConclusive = LastEvidence(state) is not { } evidence || now - evidence >= AbsentWindow;
 
             // Threshold mode. Only a fresh measurement can decide it: a signed-out reading or
             // a connection alone cannot stand in for distance.
             if (threshold is int limit && state.HasReportedRssi)
             {
-                if (!measurementMinutes)
+                if (!hasRecentMeasurement)
                 {
-                    if (silenceConclusive)
+                    if (state.RssiAt is not { } lastRssi || now - lastRssi >= AbsentWindow)
                     {
                         state.LastPresent = false;
                         return new BluetoothStatus(BluetoothPresence.Absent, BluetoothReason.NoRecentSignal);
@@ -488,9 +537,9 @@ public sealed class BluetoothMonitor : IDisposable
     }
 
     /// <summary>
-    /// True when the address is a rotating privacy address, or was never seen advertising
-    /// and is not a paired device. Such an address cannot be matched reliably, which is the
-    /// usual reason a selection produces constant lock/unlock flapping.
+    /// True when an unpaired device advertises a random address. Random addresses include
+    /// both static and rotating forms; without a paired identity this monitor does not
+    /// establish whether the observed address will remain stable, so selection is restricted.
     /// </summary>
     public bool IsUnstableIdentity(string? address)
     {
@@ -508,9 +557,19 @@ public sealed class BluetoothMonitor : IDisposable
         var advertisedName = args.Advertisement.LocalName;
         var address = args.BluetoothAddress;
         bool needsNameLookup;
+        CancellationToken token;
+        long session;
 
         lock (_gate)
         {
+            // A watcher can have one callback already queued when Stop() detaches it.
+            // Ignore that late event, including after a new watcher has started, so evidence
+            // from the previous scan session cannot repopulate the freshly cleared state.
+            if (!_active || _disposed || !ReferenceEquals(_watcher, sender))
+                return;
+
+            token = _lifetime!.Token;
+            session = _sessionId;
             var state = GetOrAdd(address);
             _hasScanned = true;
 
@@ -529,19 +588,21 @@ public sealed class BluetoothMonitor : IDisposable
             // BLE reports -127 for "unknown", so only a real reading proves this hardware
             // can be measured against a threshold at all.
             if (state.Rssi != RssiUnknown) state.HasReportedRssi = true;
-            // A random (privacy) address means the device rotates its identity, so it can
-            // never be matched reliably over time; the picker warns about selecting one.
+            // Random addresses may be static or may rotate for privacy. Record the
+            // reported type so the picker can restrict unpaired identities whose
+            // long-term stability has not been established.
             state.RandomAddress = args.BluetoothAddressType == BluetoothAddressType.Random;
 
             Evict();
 
             needsNameLookup = string.IsNullOrWhiteSpace(state.Name)
                               && !_resolvedNames.ContainsKey(address)
+                              && _nameLookupsInFlight.Count < 4
                               && _nameLookupsInFlight.Add(address);
         }
 
         if (needsNameLookup)
-            _ = ResolveNameAsync(address);
+            _ = ResolveNameAsync(address, token, session);
     }
 
     private State GetOrAdd(ulong address)
@@ -572,16 +633,35 @@ public sealed class BluetoothMonitor : IDisposable
         if (Interlocked.Exchange(ref _pairedRefreshRunning, 1) != 0) return;
         try
         {
-            var lowEnergyFound = await FindPairedAsync(BluetoothLEDevice.GetDeviceSelectorFromPairingState(true)).ConfigureAwait(false);
-            var classicFound = await FindPairedAsync(BluetoothDevice.GetDeviceSelectorFromPairingState(true)).ConfigureAwait(false);
+            CancellationToken token;
+            long session;
+            lock (_gate)
+            {
+                if (!_active || _disposed || _lifetime is null) return;
+                // Capture these together: Stop/Start must never combine an old (or
+                // absent) cancellation token with a newly started session number.
+                token = _lifetime.Token;
+                session = _sessionId;
+            }
+            if (!IsCurrentSession(token, session)) return;
+            var lowEnergyResult = await FindPairedAsync(BluetoothLEDevice.GetDeviceSelectorFromPairingState(true), token).ConfigureAwait(false);
+            if (!IsCurrentSession(token, session)) return;
+            var classicResult = await FindPairedAsync(BluetoothDevice.GetDeviceSelectorFromPairingState(true), token).ConfigureAwait(false);
+            if (!IsCurrentSession(token, session)) return;
 
             lock (_gate)
             {
-                if (lowEnergyFound.Count > 0 || classicFound.Count > 0)
+                if (!IsCurrentSession(token, session)) return;
+                if (lowEnergyResult.Succeeded && classicResult.Succeeded
+                    && (lowEnergyResult.Devices.Count > 0 || classicResult.Devices.Count > 0))
                     _hasScanned = true;
 
-                Apply(lowEnergyFound, isLowEnergy: true);
-                Apply(classicFound, isLowEnergy: false);
+                // Reconcile the complete paired set only after both independent
+                // enumerations succeeded. A transient failure must not make every
+                // paired device appear unpaired, while a successful empty result must
+                // clear devices that have since been unpaired.
+                if (lowEnergyResult.Succeeded && classicResult.Succeeded)
+                    Apply(lowEnergyResult.Devices, classicResult.Devices);
             }
         }
         catch
@@ -593,20 +673,57 @@ public sealed class BluetoothMonitor : IDisposable
             Interlocked.Exchange(ref _pairedRefreshRunning, 0);
         }
 
-        void Apply(List<(ulong Address, string? Name)> found, bool isLowEnergy)
+        void Apply(List<(ulong Address, string? Name)> lowEnergyFound,
+                   List<(ulong Address, string? Name)> classicFound)
         {
-            foreach (var (address, name) in found)
+            var found = new Dictionary<ulong, (string? Name, bool IsLowEnergy)>();
+            foreach (var (address, name) in lowEnergyFound)
+                found[address] = (name, true);
+            foreach (var (address, name) in classicFound)
+            {
+                // Prefer the low-energy handle when an endpoint is exposed by both
+                // selectors; it supports the same ConnectionStatus query and avoids
+                // replacing a useful handle on every refresh.
+                if (!found.ContainsKey(address)) found[address] = (name, false);
+            }
+
+            var removed = new List<PairedHandle>();
+            foreach (var address in _states.Keys.ToList())
+            {
+                if (!_states.TryGetValue(address, out var state) || !state.IsPaired) continue;
+                if (found.ContainsKey(address)) continue;
+                state.IsPaired = false;
+                state.Connected = false;
+                state.ConnectionStatusAt = null;
+                if (_handles.Remove(address, out var stale)) removed.Add(stale);
+            }
+
+            foreach (var (address, descriptor) in found)
             {
                 var state = GetOrAdd(address);
                 // Pairing proves identity, not presence: the device may be switched off or
                 // out of range. It is kept in the list so the user can recognise it, but its
                 // presence still has to be established by a connection or an advertisement.
                 state.IsPaired = true;
-                if (string.IsNullOrWhiteSpace(state.Name) && !string.IsNullOrWhiteSpace(name))
-                    state.Name = name;
+                if (string.IsNullOrWhiteSpace(state.Name) && !string.IsNullOrWhiteSpace(descriptor.Name))
+                    state.Name = descriptor.Name;
 
-                if (!_handles.ContainsKey(address))
-                    _handles[address] = new PairedHandle { IsLowEnergy = isLowEnergy };
+                if (_handles.TryGetValue(address, out var existing)
+                    && existing.IsLowEnergy == descriptor.IsLowEnergy)
+                    continue;
+
+                if (existing is not null)
+                {
+                    _handles.Remove(address);
+                    removed.Add(existing);
+                }
+                _handles[address] = new PairedHandle { IsLowEnergy = descriptor.IsLowEnergy };
+            }
+
+            foreach (var handle in removed)
+            {
+                try { handle.Classic?.Dispose(); } catch { }
+                try { handle.LowEnergy?.Dispose(); } catch { }
             }
         }
     }
@@ -621,9 +738,17 @@ public sealed class BluetoothMonitor : IDisposable
         if (Interlocked.Exchange(ref _connectionPollRunning, 1) != 0) return;
         try
         {
-            var token = _lifetime?.Token ?? CancellationToken.None;
+            CancellationToken token;
+            long session;
             List<(ulong Address, PairedHandle Handle)> handles;
-            lock (_gate) handles = _handles.Select(pair => (pair.Key, pair.Value)).ToList();
+            lock (_gate)
+            {
+                if (!_active || _disposed || _lifetime is null) return;
+                token = _lifetime.Token;
+                session = _sessionId;
+                handles = _handles.Select(pair => (pair.Key, pair.Value)).ToList();
+            }
+            if (!IsCurrentSession(token, session)) return;
 
             foreach (var (address, handle) in handles)
             {
@@ -632,15 +757,33 @@ public sealed class BluetoothMonitor : IDisposable
                 {
                     if (handle.IsLowEnergy)
                     {
-                        handle.LowEnergy ??= await CreateLowEnergyAsync(address, token).ConfigureAwait(false);
-                        if (handle.LowEnergy is null) continue;
-                        Record(address, handle.LowEnergy.ConnectionStatus == BluetoothConnectionStatus.Connected, handle.LowEnergy.Name);
+                        if (handle.LowEnergy is null)
+                        {
+                            var device = await CreateLowEnergyAsync(address, token).ConfigureAwait(false);
+                            if (device is null) continue;
+                            if (!TryAttachDevice(address, handle, session, token, device, isLowEnergy: true))
+                                continue;
+                        }
+                        var lowEnergy = handle.LowEnergy;
+                        if (lowEnergy is null) continue;
+                        Record(address, handle, session,
+                            lowEnergy.ConnectionStatus == BluetoothConnectionStatus.Connected,
+                            lowEnergy.Name, token);
                     }
                     else
                     {
-                        handle.Classic ??= await CreateClassicAsync(address, token).ConfigureAwait(false);
-                        if (handle.Classic is null) continue;
-                        Record(address, handle.Classic.ConnectionStatus == BluetoothConnectionStatus.Connected, handle.Classic.Name);
+                        if (handle.Classic is null)
+                        {
+                            var device = await CreateClassicAsync(address, token).ConfigureAwait(false);
+                            if (device is null) continue;
+                            if (!TryAttachDevice(address, handle, session, token, device, isLowEnergy: false))
+                                continue;
+                        }
+                        var classic = handle.Classic;
+                        if (classic is null) continue;
+                        Record(address, handle, session,
+                            classic.ConnectionStatus == BluetoothConnectionStatus.Connected,
+                            classic.Name, token);
                     }
                 }
                 catch (OperationCanceledException)
@@ -652,7 +795,7 @@ public sealed class BluetoothMonitor : IDisposable
                     // A handle can become invalid when the radio resets or the device is
                     // removed. Drop it so the next paired refresh recreates it; the
                     // connection reading then ages out instead of pinning the device present.
-                    DropHandle(address);
+                    DropHandle(address, handle, session);
                 }
             }
         }
@@ -667,12 +810,14 @@ public sealed class BluetoothMonitor : IDisposable
         }
     }
 
-    private void DropHandle(ulong address)
+    private void DropHandle(ulong address, PairedHandle expected, long session)
     {
         PairedHandle? handle;
         lock (_gate)
         {
+            if (Volatile.Read(ref _sessionId) != session || !_active) return;
             if (!_handles.TryGetValue(address, out handle)) return;
+            if (!ReferenceEquals(handle, expected)) return;
             _handles.Remove(address);
             // A device that is no longer readable is still paired, so its state (and name)
             // stays; only the connection reading is invalidated.
@@ -682,6 +827,44 @@ public sealed class BluetoothMonitor : IDisposable
 
         try { handle.Classic?.Dispose(); } catch { }
         try { handle.LowEnergy?.Dispose(); } catch { }
+    }
+
+    private bool TryAttachDevice(ulong address, PairedHandle expected, long session,
+                                 CancellationToken token, object device, bool isLowEnergy)
+    {
+        object? duplicate = null;
+        lock (_gate)
+        {
+            if (!IsCurrentSession(token, session)
+                || !_handles.TryGetValue(address, out var current)
+                || !ReferenceEquals(current, expected))
+            {
+                // The async factory completed after Stop() or after this handle was
+                // replaced. The caller owns the just-created object and must release it.
+                duplicate = device;
+            }
+            else if (isLowEnergy)
+            {
+                if (expected.LowEnergy is null) expected.LowEnergy = (BluetoothLEDevice)device;
+                else duplicate = device;
+            }
+            else
+            {
+                if (expected.Classic is null) expected.Classic = (BluetoothDevice)device;
+                else duplicate = device;
+            }
+        }
+
+        if (duplicate is BluetoothLEDevice lowEnergy)
+        {
+            try { lowEnergy.Dispose(); } catch { }
+        }
+        else if (duplicate is BluetoothDevice classic)
+        {
+            try { classic.Dispose(); } catch { }
+        }
+
+        return duplicate is null;
     }
 
     private static async Task<BluetoothDevice?> CreateClassicAsync(ulong address, CancellationToken token)
@@ -714,10 +897,13 @@ public sealed class BluetoothMonitor : IDisposable
         }
     }
 
-    private void Record(ulong address, bool connected, string? name)
+    private void Record(ulong address, PairedHandle expected, long session,
+                        bool connected, string? name, CancellationToken token)
     {
         lock (_gate)
         {
+            if (!IsCurrentSession(token, session)) return;
+            if (!_handles.TryGetValue(address, out var current) || !ReferenceEquals(current, expected)) return;
             if (!_states.TryGetValue(address, out var state)) return;
             state.Connected = connected;
             // Only a successful read stamps this, which is what lets a stale "connected"
@@ -728,7 +914,7 @@ public sealed class BluetoothMonitor : IDisposable
         }
     }
 
-    private static async Task<List<(ulong Address, string? Name)>> FindPairedAsync(string selector)
+    private static async Task<PairedQueryResult> FindPairedAsync(string selector, CancellationToken token)
     {
         var result = new List<(ulong, string?)>();
         try
@@ -736,7 +922,7 @@ public sealed class BluetoothMonitor : IDisposable
             var properties = new[] { "System.Devices.Aep.DeviceAddress" };
             var found = await DeviceInformation
                 .FindAllAsync(selector, properties, DeviceInformationKind.AssociationEndpoint)
-                .AsTask().ConfigureAwait(false);
+                .AsTask(token).ConfigureAwait(false);
 
             foreach (var information in found)
             {
@@ -755,12 +941,17 @@ public sealed class BluetoothMonitor : IDisposable
                 // ConnectionStatus, because the AEP flag is not reliable on every machine.
                 result.Add((address, information.Name));
             }
+            return new PairedQueryResult(result, true);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {
             // A locked-down or radio-less machine simply yields no paired devices.
+            return new PairedQueryResult(result, false);
         }
-        return result;
     }
 
 
@@ -769,13 +960,16 @@ public sealed class BluetoothMonitor : IDisposable
     /// the device object rather than in the advertisement, which is what left the picker
     /// full of identical "未知设备" rows.
     /// </summary>
-    private async Task ResolveNameAsync(ulong address)
+    private async Task ResolveNameAsync(ulong address, CancellationToken token, long session)
     {
         string? name = null;
         BluetoothLEDevice? device = null;
+        var slotAcquired = false;
         try
         {
-            var token = _lifetime?.Token ?? CancellationToken.None;
+            await _nameLookupSlots.WaitAsync(token).ConfigureAwait(false);
+            slotAcquired = true;
+            if (!IsCurrentSession(token, session)) return;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeout.CancelAfter(NameLookupTimeout);
             device = await BluetoothLEDevice.FromBluetoothAddressAsync(address).AsTask(timeout.Token).ConfigureAwait(false);
@@ -796,13 +990,22 @@ public sealed class BluetoothMonitor : IDisposable
             {
                 // Record the attempt either way so an unnamed device is not re-queried on
                 // every subsequent advertisement.
-                _resolvedNames[address] = name;
-                _nameLookupsInFlight.Remove(address);
-                if (!string.IsNullOrWhiteSpace(name) && _states.TryGetValue(address, out var state))
-                    state.Name = name;
+                if (IsCurrentSession(token, session))
+                {
+                    _nameLookupsInFlight.Remove(address);
+                    if (_states.TryGetValue(address, out var state))
+                    {
+                        _resolvedNames[address] = name;
+                        if (!string.IsNullOrWhiteSpace(name)) state.Name = name;
+                    }
+                }
             }
 
             try { device?.Dispose(); } catch { }
+            if (slotAcquired)
+            {
+                try { _nameLookupSlots.Release(); } catch (SemaphoreFullException) { }
+            }
         }
     }
 
