@@ -137,6 +137,12 @@
                     VerticalScrollBarVisibility="Auto">
                     <Grid Margin="0,12,0,0" Style="{StaticResource SettingsGridStyle}">
                         <StackPanel Spacing="{StaticResource SettingsCardSpacing}">
+                            <InfoBar x:Name="StartupWarningBar" IsOpen="False" IsClosable="False"
+                                     Severity="Warning" Title="需要检查设置">
+                                <InfoBar.ActionButton>
+                                    <Button Content="保存当前设置" Click="RetrySettings_Click" />
+                                </InfoBar.ActionButton>
+                            </InfoBar>
                             <!--
                                 Each page is hosted in a ContentControl so an inactive policy page can be
                                 genuinely disabled. A panel with IsHitTestVisible=false only stops the
@@ -215,12 +221,12 @@
                                         <controls:SettingsCard.HeaderIcon>
                                             <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE702;" />
                                         </controls:SettingsCard.HeaderIcon>
-                                        <!-- A fixed content width is required, not just a minimum:
-                                             SettingsCard lays its content out at its natural width, so
-                                             an unconstrained child (the wrapping summary below) expands
-                                             to its full unwrapped line and squeezes the header/description
-                                             column into a one-character-wide strip. -->
-                                        <Grid Width="460" RowSpacing="12">
+                                        <!-- Bound natural content width so long summaries cannot
+                                             squeeze the header, while allowing smaller windows to shrink. -->
+                                        <Grid
+                                            MaxWidth="460"
+                                            HorizontalAlignment="Stretch"
+                                            RowSpacing="12">
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="Auto" />
                                                 <RowDefinition Height="Auto" />
@@ -396,9 +402,11 @@
                                         <controls:SettingsCard.HeaderIcon>
                                             <FontIcon FontFamily="{StaticResource SegoeFluentIcons}" Glyph="&#xE8C8;" />
                                         </controls:SettingsCard.HeaderIcon>
-                                        <!-- Fixed width for the same reason as the Bluetooth card: it
-                                             keeps the header/description column from being squeezed. -->
-                                        <Grid Width="460" RowSpacing="12">
+                                        <!-- Limit width on large windows while allowing the content to shrink. -->
+                                        <Grid
+                                            MaxWidth="460"
+                                            HorizontalAlignment="Stretch"
+                                            RowSpacing="12">
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="Auto" />
                                                 <RowDefinition Height="Auto" />

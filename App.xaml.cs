@@ -34,7 +34,8 @@ public partial class App : Application
         // after runtime setup so startup XAML failures are not masked by a blank app.
         Services.Start(MainWindow);
         MainWindow.InitializeRuntime();
-        MainWindow.HideShell();
+        if (Services.StartupWarning is null) MainWindow.HideShell();
+        else MainWindow.ShowShell();
     }
 
     public void ShowSettings()
@@ -52,18 +53,14 @@ public partial class App : Application
     public void ExitApplication()
     {
         if (Interlocked.Exchange(ref _shutdownStarted, 1) != 0) return;
-        try
-        {
-            Services.Stop();
-            MainWindow?.ShutdownResources();
-            MainWindow?.AllowClose();
-            TrayWindow?.Close();
-            MainWindow?.Close();
-        }
-        catch
-        {
-            // Process termination below is the final cleanup boundary.
-        }
+        // The settings editor uses a 400 ms debounce timer.  Flush while the
+        // coordinator and UI dispatcher are still alive, before disposing services.
+        try { MainWindow?.FlushPendingSettings(); } catch { }
+        try { MainWindow?.ShutdownResources(); } catch { }
+        try { Services.Stop(); } catch { }
+        try { MainWindow?.AllowClose(); } catch { }
+        try { TrayWindow?.Close(); } catch { }
+        try { MainWindow?.Close(); } catch { }
         finally
         {
             Environment.Exit(0);
@@ -71,13 +68,14 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Cleanup path used by ProcessExit and unhandled exceptions. It deliberately
-    /// avoids UI calls that require a live dispatcher. Native overlay and hook
-    /// resources are owned by disposable services and are safe to stop directly.
+    /// Cleanup path used by ProcessExit and unhandled exceptions. The last-chance
+    /// editor flush only runs when the caller still owns the UI dispatcher; native
+    /// overlay and hook resources are then stopped directly.
     /// </summary>
     public void ShutdownForProcessExit()
     {
         if (Interlocked.Exchange(ref _shutdownStarted, 1) != 0) return;
+        try { MainWindow?.FlushPendingSettings(); } catch { }
         try { Services.Stop(); } catch { }
         try { MainWindow?.ShutdownResources(); } catch { }
     }

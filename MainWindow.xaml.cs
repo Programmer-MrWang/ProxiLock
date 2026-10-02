@@ -57,6 +57,12 @@ public sealed partial class MainWindow : Window
     private string _usbSignature = string.Empty;
     private BluetoothDeviceInfo? _selectedBluetooth;
     private UsbDeviceInfo? _selectedUsb;
+    // Keep the last successfully persisted device selection separate from the row that is
+    // currently highlighted.  A save can fail (for example while the settings file is
+    // temporarily unavailable), and in that case the transient row must not remain in the
+    // UI as if it had become the active credential.
+    private string? _committedBluetoothAddress;
+    private string? _committedUsbInstanceId;
     private Button? _paneToggleButton;
     private IntPtr _windowHandle;
 
@@ -144,10 +150,18 @@ public sealed partial class MainWindow : Window
 
             // Keep a margin so the window reads as a floating window, but never
             // request more than the display can actually show.
-            var width = (int)Math.Min(requested.Width, Math.Max(720, workArea.Width - 120));
-            var height = (int)Math.Min(requested.Height, Math.Max(520, workArea.Height - 120));
+            var width = Math.Max(1, Math.Min(workArea.Width, Math.Min(requested.Width, Math.Max(720, workArea.Width - 120))));
+            var height = Math.Max(1, Math.Min(workArea.Height, Math.Min(requested.Height, Math.Max(520, workArea.Height - 120))));
             var size = new SizeInt32(width, height);
             AppWindow.Resize(size);
+
+            // AppWindow uses physical pixels while XAML uses effective pixels. Account
+            // for display scaling before deciding whether the navigation pane fits.
+            var dpi = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+            var scale = dpi == 0 ? 1d : dpi / 96d;
+            var paneOpen = width / scale >= 860;
+            SettingsNavigationView.IsPaneOpen = paneOpen;
+            UpdateNavigationPaneVisuals(paneOpen);
 
             var x = workArea.X + Math.Max(0, (workArea.Width - size.Width) / 2);
             var y = workArea.Y + Math.Max(0, (workArea.Height - size.Height) / 2);
@@ -166,6 +180,8 @@ public sealed partial class MainWindow : Window
         _initialized = true;
         _services.LockCoordinator.LockStateChanged += LockCoordinator_LockStateChanged;
         LoadSettings(_services.Settings);
+        StartupWarningBar.Message = _services.StartupWarning;
+        StartupWarningBar.IsOpen = _services.StartupWarning is not null;
         RefreshUsbList();
         UpdateStatus(_services.LockCoordinator.IsLocked);
         // Settings and controls are fully initialized before policy evaluation is armed.
@@ -224,6 +240,7 @@ public sealed partial class MainWindow : Window
     public void ShutdownResources()
     {
         if (_resourcesShutdown) return;
+        FlushPendingSettings();
         _resourcesShutdown = true;
         _usbTimer.Stop();
         _bluetoothTimer.Stop();
@@ -232,9 +249,32 @@ public sealed partial class MainWindow : Window
             _services.LockCoordinator.LockStateChanged -= LockCoordinator_LockStateChanged;
     }
 
+    /// <summary>
+    /// Applies a pending text edit before teardown.  The debounce timer is intentionally
+    /// short for normal typing, but stopping it during exit used to lose the final edit.
+    /// This method is safe to call more than once and is a no-op when the dispatcher is no
+    /// longer available.
+    /// </summary>
+    public void FlushPendingSettings()
+    {
+        if (_resourcesShutdown || !_initialized || !_applyTimer.IsRunning) return;
+        try
+        {
+            if (!DispatcherQueue.HasThreadAccess) return;
+            _applyTimer.Stop();
+            ApplyCurrentSettings();
+        }
+        catch
+        {
+            // Teardown must continue even if a last-chance save cannot be completed.
+        }
+    }
+
     private void LoadSettings(AppSettings settings)
     {
         using var suppress = new SuppressScope(this);
+        _committedBluetoothAddress = settings.Bluetooth.DeviceAddress;
+        _committedUsbInstanceId = settings.Usb.DeviceInstanceId;
         NoneRadio.IsChecked = settings.LockMode == LockMode.None;
         BluetoothRadio.IsChecked = settings.LockMode == LockMode.Bluetooth;
         UsbRadio.IsChecked = settings.LockMode == LockMode.Usb;
@@ -769,9 +809,21 @@ public sealed partial class MainWindow : Window
 
     private void BluetoothList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressAutoSave) return;
         if (BluetoothList.SelectedItem is not BluetoothDeviceInfo selected) return;
+
+        // Rotating privacy addresses cannot be used as a stable credential.  Reject the
+        // selection immediately and restore the last value that was actually persisted.
+        if (!selected.IsStable || _services.LockCoordinator.Bluetooth.IsUnstableIdentity(selected.Address))
+        {
+            ShowError("无法选择随机蓝牙地址。请改选已配对的设备或固定地址设备。");
+            RestoreBluetoothSelection();
+            return;
+        }
+
         _selectedBluetooth = selected;
-        ApplyCurrentSettings();
+        if (!ApplyCurrentSettings())
+            RestoreBluetoothSelection();
     }
 
     private void RefreshUsb_Click(object sender, RoutedEventArgs e) => RefreshUsbList();
@@ -801,7 +853,9 @@ public sealed partial class MainWindow : Window
     {
         if (_resourcesShutdown) return;
         var signature = string.Join('\u001f', devices.Select(d => $"{d.DriveLetter}|{d.Name}|{d.InstanceId}"));
-        var selected = _selectedUsb?.InstanceId ?? _services.Settings?.Usb?.DeviceInstanceId;
+        var selected = !string.IsNullOrWhiteSpace(_selectedUsb?.InstanceId)
+            ? _selectedUsb.InstanceId
+            : _services.Settings?.Usb?.DeviceInstanceId;
 
         using var suppress = new SuppressScope(this);
         if (signature != _usbSignature)
@@ -811,7 +865,7 @@ public sealed partial class MainWindow : Window
         }
         UsbEmptyState.Visibility = devices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-        if (selected is not null)
+        if (!string.IsNullOrWhiteSpace(selected))
         {
             // Restore the selection from the list that is actually bound. A scan returns
             // brand-new instances, so searching the fresh collection can pick an object that
@@ -831,17 +885,78 @@ public sealed partial class MainWindow : Window
 
     private void UsbList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressAutoSave) return;
         if (UsbList.SelectedItem is not UsbDeviceInfo selected) return;
+        if (string.IsNullOrWhiteSpace(selected.InstanceId))
+        {
+            ShowError("该设备没有可验证的硬件标识，不能用作锁定凭证。请重新插入设备或选择其他设备。");
+            RestoreUsbSelection();
+            return;
+        }
         _selectedUsb = selected;
         UsbIdText.Text = $"实例 ID：{selected.InstanceId}";
-        ApplyCurrentSettings();
+        if (!ApplyCurrentSettings())
+            RestoreUsbSelection();
+    }
+
+    private void RestoreBluetoothSelection()
+    {
+        var address = _committedBluetoothAddress;
+        using var suppress = new SuppressScope(this);
+        _selectedBluetooth = null;
+        BluetoothList.SelectedItem = null;
+        if (!string.IsNullOrWhiteSpace(address)
+            && BluetoothList.ItemsSource is IEnumerable<BluetoothDeviceInfo> devices)
+        {
+            var matching = devices.FirstOrDefault(d =>
+                string.Equals(d.Address, address, StringComparison.OrdinalIgnoreCase));
+            if (matching is not null)
+            {
+                _selectedBluetooth = matching;
+                BluetoothList.SelectedItem = matching;
+            }
+        }
+
+        UpdateBluetoothSelectionSummary(address);
+    }
+
+    private void RestoreUsbSelection()
+    {
+        var instanceId = _committedUsbInstanceId;
+        using var suppress = new SuppressScope(this);
+        _selectedUsb = null;
+        UsbList.SelectedItem = null;
+        if (!string.IsNullOrWhiteSpace(instanceId)
+            && UsbList.ItemsSource is IEnumerable<UsbDeviceInfo> devices)
+        {
+            var matching = devices.FirstOrDefault(d =>
+                string.Equals(d.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase)
+                || d.Identifiers.Contains(instanceId, StringComparer.OrdinalIgnoreCase));
+            if (matching is not null)
+            {
+                _selectedUsb = matching;
+                UsbList.SelectedItem = matching;
+                UsbIdText.Text = $"实例 ID：{matching.InstanceId}";
+            }
+        }
+
+        if (_selectedUsb is null)
+            UsbIdText.Text = string.Empty;
     }
 
     private void BluetoothThresholdBox_TextChanged(object sender, TextChangedEventArgs e) => ScheduleApply();
 
     private void IdleMinutesBox_TextChanged(object sender, TextChangedEventArgs e) => ScheduleApply();
 
-    private void AutoStartCheckBox_Changed(object sender, RoutedEventArgs e) => ApplyCurrentSettings();
+    private void AutoStartCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_initialized || _suppressAutoSave) return;
+        if (ApplyCurrentSettings()) return;
+        using var suppress = new SuppressScope(this);
+        AutoStartCheckBox.IsChecked = _services.Settings.AutoStart;
+    }
+
+    private void RetrySettings_Click(object sender, RoutedEventArgs e) => ApplyCurrentSettings();
 
     /// <summary>
     /// Coalesces keystroke-driven edits into a single apply. Typing "-70" would
@@ -878,6 +993,15 @@ public sealed partial class MainWindow : Window
         else if (mode == LockMode.Bluetooth)
             return false;
 
+        var bluetoothAddress = _selectedBluetooth?.Address ?? source.Bluetooth.DeviceAddress;
+        if (mode == LockMode.Bluetooth
+            && !string.IsNullOrWhiteSpace(bluetoothAddress)
+            && _services.LockCoordinator.Bluetooth.IsUnstableIdentity(bluetoothAddress))
+        {
+            ShowError("无法保存随机蓝牙地址。请改选已配对的设备或固定地址设备。");
+            return false;
+        }
+
         var minutes = source.Idle.Minutes;
         if (int.TryParse(IdleMinutesBox.Text, out var parsedMinutes) && parsedMinutes is >= 1 and <= 1440)
             minutes = parsedMinutes;
@@ -892,12 +1016,14 @@ public sealed partial class MainWindow : Window
             LockMode = mode,
             Bluetooth = new BluetoothSettings
             {
-                DeviceAddress = _selectedBluetooth?.Address ?? source.Bluetooth.DeviceAddress,
+                DeviceAddress = bluetoothAddress,
                 Threshold = threshold
             },
             Usb = new UsbSettings
             {
-                DeviceInstanceId = _selectedUsb?.InstanceId ?? source.Usb.DeviceInstanceId
+                DeviceInstanceId = !string.IsNullOrWhiteSpace(_selectedUsb?.InstanceId)
+                    ? _selectedUsb.InstanceId
+                    : source.Usb.DeviceInstanceId
             },
             Idle = new IdleSettings { Minutes = minutes },
             AutoStart = AutoStartCheckBox.IsChecked == true
@@ -922,6 +1048,9 @@ public sealed partial class MainWindow : Window
             }
             // Choosing a device satisfies the policy's prerequisite, so the warning
             // in the hint bar has to be re-evaluated after the settings are applied.
+            StartupWarningBar.IsOpen = false;
+            _committedBluetoothAddress = settings.Bluetooth.DeviceAddress;
+            _committedUsbInstanceId = settings.Usb.DeviceInstanceId;
             UpdateModeUi(mode);
             return true;
         }
@@ -1116,4 +1245,5 @@ public sealed partial class MainWindow : Window
     private const int SwShow = 5;
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int command);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
 }
